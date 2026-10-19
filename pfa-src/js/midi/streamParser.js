@@ -55,10 +55,6 @@ var StreamParser = (function () {
                                 // 180). Above the cap the ramp is RESAMPLED, not
                                 // truncated (see finalizeTempo), so late-song
                                 // tempos stay correct even for 10M-event files.
-  var TEMPO_MIN_TICK_GAP = 10; // discard tempo changes closer than this many
-                                // ticks (< ~3ms of music) — inaudible, but
-                                // collapses 1-2-tick spam and duplicated value
-                                // runs that would explode RAM during parsing.
 
   // Single-flight conversion guard + per-conversion file token.
   // Two overlapping conversions share the same tmp dir on device; without this
@@ -390,8 +386,7 @@ var PARSE_QUOTA_BYTES = 256 * 1024;   // ~256KB of track bytes parsed per slice
       off: 0, curTick: 0, runningStatus: 0, runningChannel: 0,
       active: {}, batch: [], noteCount: 0, maxTick: 0, closed: false, atEnd: false,
       tempo: [],           // FF 51 set-tempo records {t, u} gathered for this track
-      tempoLastU: 0,       // last tempo (usec/qn) kept for this track
-      tempoLastT: -Infinity// tick of the last tempo kept for this track
+      tempoLastU: 0        // last tempo (usec/qn) kept for this track
     };
   }
 
@@ -473,12 +468,9 @@ var PARSE_QUOTA_BYTES = 256 * 1024;   // ~256KB of track bytes parsed per slice
       // All required bytes verified in-window → commit this event atomically.
       curTick += vlq.value;
       if (curTick > maxTick) maxTick = curTick;
-      if (tempoUsec > 0 &&
-          tempoUsec !== state.tempoLastU &&
-          curTick - state.tempoLastT >= TEMPO_MIN_TICK_GAP) {
+      if (tempoUsec > 0 && tempoUsec !== state.tempoLastU) {
         state.tempo.push({ t: curTick, u: tempoUsec });
         state.tempoLastU = tempoUsec;
-        state.tempoLastT = curTick;
       }
       off = p + skip;
 
@@ -597,12 +589,19 @@ var PARSE_QUOTA_BYTES = 256 * 1024;   // ~256KB of track bytes parsed per slice
           });
         }
         function writeBatch(u8) {
-          return dsAppendNamed(st, new Blob([u8.buffer], { type: 'application/octet-stream' }), outPath);
+          var tA = Date.now();
+          return dsAppendNamed(st, new Blob([u8.buffer], { type: 'application/octet-stream' }), outPath).then(function (r) {
+            var dt = Date.now() - tA;
+            appCount++; appMs += dt;
+            if (appCount % 10 === 0 || dt > 3000) console.log('[StreamParser] append #' + appCount + ' ' + (u8.byteLength >> 10) + 'KB in ' + dt + 'ms');
+            return r;
+          });
         }
         // Output is packed straight into a byte buffer — no per-note objects.
         var out = new Uint8Array(FIN_BATCH * NOTE_SIZE);
         var n = 0;       // notes currently packed in out
         var written = 0; // notes flushed to disk
+        var appCount = 0, appMs = 0; // append ops + total append latency
         var loopLogAt = 0;
         function flush() {
           if (!n) return Promise.resolve();
@@ -677,7 +676,7 @@ var PARSE_QUOTA_BYTES = 256 * 1024;   // ~256KB of track bytes parsed per slice
           console.log('[StreamParser] merge openAll done, readers=' + readers.length);
           return run();
         }).then(function () {
-          console.log('[StreamParser] merge loop done, heapKB=' + heapKB());
+          console.log('[StreamParser] merge loop done, heapKB=' + heapKB() + ' appends=' + appCount + ' appMs=' + appMs);
           // Free every reader's file+buffer and the output buffer so the merge
           // closure can't pin them. SpiderMonkey won't return this heap to the
           // OS, so the only way Device Manager drops back after a big merge is
@@ -751,7 +750,7 @@ var PARSE_QUOTA_BYTES = 256 * 1024;   // ~256KB of track bytes parsed per slice
       // Refuse so we never start scraping the shared tmp dir while another
       // conversion is writing runs there. Callers consume onDone/onError, so
       // resolve (not reject) to avoid an unhandled rejection down the chain.
-      var busy = 'A conversion is already running';
+      var busy = L10n.t('err_conversion_running', 'A conversion is already running');
       console.error('[StreamParser] ' + busy);
       if (opts.onError) opts.onError(busy || 'stream parse failed');
       return Promise.resolve();
@@ -794,7 +793,7 @@ var PARSE_QUOTA_BYTES = 256 * 1024;   // ~256KB of track bytes parsed per slice
         // error dialog can never replace it. onCancel resets the busy flag and
         // hides the parsing pill, leaving the dialog visible.
         _converting = false;
-        if (opts.onCancel) opts.onCancel('Storage permission denied — grant SD card access to convert');
+        if (opts.onCancel) opts.onCancel(L10n.t('err_storage_denied', 'Storage permission denied - grant SD card access to convert'));
         return;
       }
       if (!stInfo || !stInfo.st) throw new Error('No writable storage');
@@ -888,7 +887,7 @@ var PARSE_QUOTA_BYTES = 256 * 1024;   // ~256KB of track bytes parsed per slice
         .then(function () { console.log('[StreamParser] cleanTmpDir done'); return ensureDir(st, dir); })
         .then(function () { console.log('[StreamParser] ensureDir done'); return readHeader(blob); })
         .then(function (hdr) {
-          console.log('[StreamParser] readHeader done: ' + hdr.tracks.length + ' tracks');
+          console.log('[StreamParser] ' + (typeof L10n !== 'undefined' ? L10n.t('readheader_done', 'readHeader done: ') : 'readHeader done: ') + hdr.tracks.length + ' ' + (typeof L10n !== 'undefined' ? L10n.t('tracks', 'tracks') : 'tracks'));
           stage('parse');
           meta.div = hdr.div;
           // Parse progress = bytes read so far ÷ total track bytes (stream
@@ -976,7 +975,7 @@ var PARSE_QUOTA_BYTES = 256 * 1024;   // ~256KB of track bytes parsed per slice
       if (e && e.name === 'CancelError') {
         console.log('[StreamParser] conversion cancelled — partial files cleaned');
         cleanUpSwept().then(function () {
-          if (opts.onCancel) opts.onCancel('Analysis cancelled');
+          if (opts.onCancel) opts.onCancel(L10n.t('toast_loading_cancelled', 'Analysis cancelled'));
           else if (opts.onError) opts.onError('Analysis cancelled');
         });
         return Promise.resolve();
@@ -1015,7 +1014,12 @@ var PARSE_QUOTA_BYTES = 256 * 1024;   // ~256KB of track bytes parsed per slice
     var seenTick = null;
     for (var k = 0; k < all.length; k++) {
       var c = all[k], u = (c.u > 0) ? c.u : defU;
-      if (seenTick !== null && c.t === seenTick) continue; // first-wins dedupe
+      // Same tick: LAST event wins (sequencer processes in order).
+      if (seenTick !== null && c.t === seenTick) {
+        if (out.length && out[out.length - 1].t === c.t) out[out.length - 1] = { t: c.t, u: u };
+        else if (!(out.length && out[out.length - 1].u === u)) out.push({ t: c.t, u: u });
+        continue;
+      }
       seenTick = c.t;
       if (out.length && out[out.length - 1].u === u) continue; // redundant repeat
       out.push({ t: c.t, u: u });
@@ -1104,11 +1108,22 @@ var PARSE_QUOTA_BYTES = 256 * 1024;   // ~256KB of track bytes parsed per slice
         }
         var group = groups[gi++];
         var outPath = dir + '/m' + token + '_' + (level++) + '_' + gi + '.bin';
-        return mergeRuns(st, group, outPath, null, swept).then(function () {
+        var gT0 = Date.now();
+        console.log('[StreamParser] group ' + gi + '/' + groups.length + ' start (' + group.length + ' inputs)');
+        // Macrotask yield between groups: lets the event loop, UI timers and
+        // lazy GC breathe between merges (pure microtask chaining can starve
+        // them while native request objects pile up).
+        return new Promise(function (r) { setTimeout(r, 0); }).then(function () {
+          return mergeRuns(st, group, outPath, null, swept);
+        }).then(function () {
           step();
+          var gT1 = Date.now();
           // remove the consumed run files
           return Promise.all(group.map(function (p) { return dsDelete(st, p); }))
-            .then(function () { mergedPaths.push(outPath); return nextGroup(); });
+            .then(function () {
+              console.log('[StreamParser] group ' + gi + '/' + groups.length + ' done mergeMs=' + (gT1 - gT0) + ' delMs=' + (Date.now() - gT1));
+              mergedPaths.push(outPath); return nextGroup();
+            });
         });
       }
       return nextGroup();

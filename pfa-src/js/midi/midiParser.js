@@ -83,63 +83,84 @@ var MidiParser = (function () {
       tracks.push(trackEvents);
     }
 
-    // --- Merge events from all tracks and sort by absolute tick ---
-    var allEvents = [];
-    for (var i = 0; i < tracks.length; i++) {
-      allEvents = allEvents.concat(tracks[i]);
-    }
-    allEvents.sort(function (a, b) { return a.tick - b.tick; });
-
     // --- Build notes and tempo arrays ---
+    // Pairing is PER TRACK (same as StreamParser): each track's
+    // (channel,note) voices are independent, so cross-track overlaps on one
+    // pitch stay overlapping instead of being chained/truncated (a global
+    // map would cut a sustained voice at another track's hit, and the
+    // synth skips the resulting sub-20ms stub — audible silence where the
+    // streaming path still rings). A retrigger WITHIN one track with no
+    // noteOff between hits still closes the previous articulation at the
+    // new onset (voice-stealing).
     var notes = []; // {t, c, n, v, d}
     var tempo = []; // {t, u}
-    var activeNotes = {} // key: channel*128+note -> {tick: onTick, velocity}
-
-    for (var e = 0; e < allEvents.length; e++) {
-      var ev = allEvents[e];
-      if (ev.type === 'noteOn' || ev.type === 'noteOff') {
-        var key = ev.channel * 128 + ev.note;
-        if (ev.type === 'noteOn' && ev.velocity > 0) {
-          // Note on
-          activeNotes[key] = { tick: ev.tick, velocity: ev.velocity };
-        } else {
-          // Note off (or note on with velocity 0)
-          var on = activeNotes[key];
-          if (on) {
-            var duration = ev.tick - on.tick;
-            if (duration < 0) duration = 0; // sanity
-            notes.push({
-              t: on.tick,
-              c: ev.channel,
-              n: ev.note,
-              v: on.velocity,
-              d: duration
-            });
-            delete activeNotes[key];
+    var lastTick = 0;
+    var dangling = []; // per-track opens closed at the global last tick
+    for (var ti = 0; ti < tracks.length; ti++) {
+      var evs = tracks[ti].slice();
+      evs.sort(function (a, b) { return a.tick - b.tick; });
+      var activeNotes = {}; // key: channel*128+note -> {tick: onTick, velocity}
+      for (var e = 0; e < evs.length; e++) {
+        var ev = evs[e];
+        if (ev.tick > lastTick) lastTick = ev.tick;
+        if (ev.type === 'noteOn' || ev.type === 'noteOff') {
+          var key = ev.channel * 128 + ev.note;
+          if (ev.type === 'noteOn' && ev.velocity > 0) {
+            // Note on — close a same-track open articulation at this tick.
+            var prev = activeNotes[key];
+            if (prev) {
+              var pd = ev.tick - prev.tick;
+              if (pd < 0) pd = 0;
+              notes.push({
+                t: prev.tick,
+                c: ev.channel,
+                n: ev.note,
+                v: prev.velocity,
+                d: pd
+              });
+            }
+            activeNotes[key] = { tick: ev.tick, velocity: ev.velocity };
+          } else {
+            // Note off (or note on with velocity 0)
+            var on = activeNotes[key];
+            if (on) {
+              var duration = ev.tick - on.tick;
+              if (duration < 0) duration = 0; // sanity
+              notes.push({
+                t: on.tick,
+                c: ev.channel,
+                n: ev.note,
+                v: on.velocity,
+                d: duration
+              });
+              delete activeNotes[key];
+            }
           }
+        } else if (ev.type === 'tempo') {
+          tempo.push({
+            t: ev.tick,
+            u: ev.microsecondsPerQuarterNote
+          });
         }
-      } else if (ev.type === 'tempo') {
-        tempo.push({
-          t: ev.tick,
-          u: ev.microsecondsPerQuarterNote
-        });
+      }
+      for (var dk in activeNotes) {
+        dangling.push({ key: +dk, on: activeNotes[dk] });
       }
     }
 
-    // Any remaining active notes? Assume they end at the last event's tick (or track end)
-    var lastTick = allEvents.length > 0 ? allEvents[allEvents.length - 1].tick : 0;
-    for (var key in activeNotes) {
-      var on = activeNotes[key];
-      var duration = lastTick - on.tick;
-      if (duration < 0) duration = 0;
-      var channel = Math.floor(key / 128);
-      var note = key % 128;
+    // Any remaining active notes? Assume they end at the last event's tick.
+    for (var di = 0; di < dangling.length; di++) {
+      var don = dangling[di].on;
+      var dduration = lastTick - don.tick;
+      if (dduration < 0) dduration = 0;
+      var dchannel = Math.floor(dangling[di].key / 128);
+      var dnote = dangling[di].key % 128;
       notes.push({
-        t: on.tick,
-        c: channel,
-        n: note,
-        v: on.velocity,
-        d: duration
+        t: don.tick,
+        c: dchannel,
+        n: dnote,
+        v: don.velocity,
+        d: dduration
       });
     }
 
@@ -147,10 +168,11 @@ var MidiParser = (function () {
     notes.sort(function (a, b) { return a.t - b.t; });
 
     // Ensure tempo array is sane: sorted ascending, deduped at equal ticks
-    // (FIRST event at a tick wins — the conductor track's value, independent
-    // of how many later tracks repeat the tick), invalid zero/usec rows
-    // dropped, and a guaranteed entry at tick 0 (spec default when the first
-    // tempo change happens later in the song).
+    // (LAST event at a tick wins — a sequencer processes events in order,
+    // so a stepped pair at one tick, e.g. a hard brake 233→31.9 BPM, takes
+    // its final value; first-wins here once played whole sections at the
+    // wrong tempo), invalid zero/usec rows dropped, and a guaranteed entry
+    // at tick 0 (spec default when the first change happens later).
     var valid = [];
     for (var ti = 0; ti < tempo.length; ti++) {
       if (tempo[ti].u > 0) valid.push(tempo[ti]);
@@ -159,7 +181,14 @@ var MidiParser = (function () {
     var dedup = [];
     var seenTick = null;
     for (var di = 0; di < sorted.length; di++) {
-      if (seenTick !== null && sorted[di].t === seenTick) continue;
+      if (seenTick !== null && sorted[di].t === seenTick) {
+        if (dedup.length && dedup[dedup.length - 1].t === sorted[di].t) {
+          dedup[dedup.length - 1] = sorted[di];
+        } else {
+          dedup.push(sorted[di]);
+        }
+        continue;
+      }
       seenTick = sorted[di].t;
       dedup.push(sorted[di]);
     }

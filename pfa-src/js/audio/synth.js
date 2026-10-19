@@ -52,7 +52,7 @@ var Synth = (function () {
   // suspended would otherwise be woken by any stray keydown/click and the
   // status-bar play indicator would reappear with nothing playing.
   function _autoResume() {
-    if (_audible && ctx && ctx.state === 'suspended') {
+    if (_audible && !_muted && ctx && ctx.state === 'suspended') {
       ctx.resume().then(function () {
         console.log('[Synth] auto-resumed OK, state=' + ctx.state);
       }).catch(function (e) {
@@ -177,18 +177,18 @@ var Synth = (function () {
 
     // 1. Kill expired voices (scheduled envelope fully done + margin)
     for (var i = 0; i < LIMIT; i++) {
-      if (voices[i].alive && performance.now() > voices[i].expires) freeSlot(i);
+      if (voices[i] && voices[i].alive && performance.now() > voices[i].expires) freeSlot(i);
     }
 
     // 2. First-free slot
     for (var j = 0; j < LIMIT; j++) {
-      if (!voices[j].alive) return j;
+      if (voices[j] && !voices[j].alive) return j;
     }
 
     // 3. Count voices per channel (for fairness)
     var chCount = [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0];
     for (var k = 0; k < LIMIT; k++) {
-      if (voices[k].alive && voices[k].ch >= 0 && voices[k].ch < 16) {
+      if (voices[k] && voices[k].alive && voices[k].ch >= 0 && voices[k].ch < 16) {
         chCount[voices[k].ch]++;
       }
     }
@@ -198,7 +198,7 @@ var Synth = (function () {
     if (channel >= 0 && channel < 16 && chCount[channel] >= MAX_PER_CHANNEL) {
       var oldestSame = -1, oldestBorn = Infinity;
       for (var m = 0; m < LIMIT; m++) {
-        if (voices[m].alive && voices[m].ch === channel && voices[m].born < oldestBorn) {
+        if (voices[m] && voices[m].alive && voices[m].ch === channel && voices[m].born < oldestBorn) {
           oldestBorn = voices[m].born;
           oldestSame = m;
         }
@@ -214,7 +214,7 @@ var Synth = (function () {
     if (overChannel !== -1) {
       var oldestOver = -1, oldestOverBorn = Infinity;
       for (var n = 0; n < LIMIT; n++) {
-        if (voices[n].alive && voices[n].ch === overChannel && voices[n].born < oldestOverBorn) {
+        if (voices[n] && voices[n].alive && voices[n].ch === overChannel && voices[n].born < oldestOverBorn) {
           oldestOverBorn = voices[n].born;
           oldestOver = n;
         }
@@ -225,7 +225,7 @@ var Synth = (function () {
     // 6. Last resort — steal oldest overall
     var idx = 0, best = Infinity;
     for (var p = 0; p < LIMIT; p++) {
-      if (voices[p].born < best) { best = voices[p].born; idx = p; }
+      if (voices[p] && voices[p].born < best) { best = voices[p].born; idx = p; }
     }
     freeSlot(idx);
     return idx;
@@ -235,10 +235,9 @@ var Synth = (function () {
 
   function noteOn(note, ch, vel, delaySec, durSec) {
     if (_muted) return;
-    if (window.Soundbank && Soundbank.isReady()) {
-      Soundbank.play(note, vel, delaySec, durSec);
-      return;
-    }
+    // Pure oscillator path — soundbank routing lives in main.js
+    // (_routeNoteToEngine picks by the Sound Engine setting), so a bank
+    // loading mid-song can never hijack this voice mid-stream.
     if (!ctx || !masterGain) return;
     if (ctx.state !== 'running') {
       _resume();
@@ -251,10 +250,12 @@ var Synth = (function () {
       return;
     }
     if (delaySec < 0) delaySec = 0;
-    // Micro-notes can't be heard as notes — as 5ms blips they only ADD a
-    // "pop" to the mix, so skip them in audio (they still render).
-    if (durSec < 0.02) return;
-    if (durSec < 0.005) durSec = 0.005;
+    // Sub-5ms dust can't carry pitch — as blips it only ADDs "pop" to the
+    // mix, so skip it in audio (it still renders). Anything at/above ~5ms
+    // MUST sound: a 0.02 floor here once muted nearly half of dense black
+    // MIDI (short spam reads as clear pips, not pops — density/clipping is
+    // handled by the dynamic headroom cap below, not by deleting music).
+    if (durSec < 0.005) return;
     if (vel < 1) return;
 
     ch = ch || 0;
@@ -358,7 +359,7 @@ var Synth = (function () {
 
   function noteOff(note, ch) {
     for (var i = 0; i < LIMIT; i++) {
-      if (voices[i].alive && voices[i].note === note && voices[i].ch === ch) {
+      if (voices[i] && voices[i].alive && voices[i].note === note && voices[i].ch === ch) {
         freeSlot(i);
         break;
       }
@@ -385,7 +386,7 @@ var Synth = (function () {
   function zoo() {
     var now = performance.now();
     for (var i = 0; i < voices.length; i++) {
-      if (voices[i].alive && now > voices[i].expires) freeSlot(i);
+      if (voices[i] && voices[i].alive && now > voices[i].expires) freeSlot(i);
       // Idle branches cost the mixer forever ("background pop" while silent). Once the
       // residual is fully gone, detach the voice from the graph — oscillator
       // keeps running (no stop/start churn), reattach on next note.
@@ -398,7 +399,7 @@ var Synth = (function () {
   }
 
   function silence() {
-    for (var i = 0; i < LIMIT; i++) if (voices[i].alive) freeSlot(i);
+    for (var i = 0; i < LIMIT; i++) if (voices[i] && voices[i].alive) freeSlot(i);
   }
 
   // Audio On/Off toggle (Settings → Synth → Audio). Muted: not a single
@@ -464,7 +465,7 @@ var Synth = (function () {
 
 	  function getVoiceCount() {
     var c = 0;
-    for (var i = 0; i < LIMIT; i++) if (voices[i].alive) c++;
+    for (var i = 0; i < LIMIT; i++) if (voices[i] && voices[i].alive) c++;
     return c;
   }
 

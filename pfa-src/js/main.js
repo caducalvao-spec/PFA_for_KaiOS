@@ -15,10 +15,15 @@
 (function () {
   'use strict';
 
+  // Build tag for on-device version checks (console: window._pfaBuildTag).
+  // Update the suffix whenever this file's behavior changes.
+  try { window._pfaBuildTag = 'main@integ-auto1mb-02'; } catch (eBT) {}
+
   var canvas, ctx;
   var width, height;
   var rafId;
   var lastFrameTime = 0, fpsCounter = 0, fpsAcc = 0;
+  var _lastPaintT = 0;   // 30fps paint gate: last painted rAF timestamp
 
   // Pending activity payload — MozActivity may fire before boot()
   // has registered the canvas / wired the Synth. Park it here and
@@ -33,6 +38,11 @@
   // and Sequencer.play(). That kills the analyzing/reading OSD and lets the
   // demo track play behind the real conversion.
   var _activityBusy = false;
+  // Hot-open session flag: set at File Manager activity intake, cleared at
+  // the first resolution (successful load OR the format-error dialog). Lets
+  // loadMIDIJson show the exit-on-OK dialog only for hot-opened files —
+  // in-app picks keep the stay-in-app dialog.
+  var _hotOpenPending = false;
 
   // ── Hot-open permission gate ──
   // A MIDI picked via File Manager (MozActivity 'open') is parsed in memory,
@@ -88,6 +98,10 @@
   // and lock transport + speed controls. Loading a real .mid/.note (or the
   // demo finishing) unlocks everything again.
   var _demoActive = false;
+  // Engine stashed when the demo forces Integrated (restored in clearDemo).
+  // Store-only (never persisted): a legacy 'system'/'preload' profile keeps
+  // working, and exiting mid-demo cannot pollute the saved setting.
+  var _demoForcedEngine = null;
   // True from demo start through the end of the demo AND after it finishes,
   // until a real .mid/.note is loaded. While true the speed/transport hot
   // keys and Note Color Randomise stay locked (greyed); loading a file is
@@ -202,6 +216,7 @@
         // Any real file serviced now means the auto-started demo must NOT
         // also boot under it (see boot()'s else-branch → startDemo()).
         _activityBusy = true;
+        _hotOpenPending = true;
 
         // Hot-open still needs storage permission for convert / export / WAV,
         // so when it is NOT granted we block the load and show the standard
@@ -217,23 +232,7 @@
         }
 
         if (blob) {
-          if (!name) name = 'picked.mid';
-          if (_isJsonName(name)) {
-            console.log('[Activity] reading blob as .note/.json...');
-            showParsing(_parsingLabel(name)); // Reading Data...
-            Store.setState({ fileName: name });
-            window._midiBlob = blob; // expose for native audio
-            window._midiName = name;
-            _openNoteFile(blob, name);
-            _foregroundAfterActivity();
-            return;
-          }
-          console.log('[Activity] routing MIDI blob, size=', blob.size);
-          showParsing(_parsingLabel(name)); // Analyzing MIDI Data...
-          Store.setState({ fileName: name });
-          window._midiBlob = blob; // expose for native audio
-          window._midiName = name;
-          _routeMidiBlob(blob, name);
+          _routeHotBlob(blob, name);
           // Do NOT call activity.postResult() — on some KaiOS 2.5
           // builds posting a result from within an async path is
           // interpreted as "handler finished" and the B2G shell
@@ -241,7 +240,6 @@
           // looking at (File Manager). Caller (File Manager) is
           // satisfied by the host app just by us having handled
           // the message handler.
-          _foregroundAfterActivity();
           return;
         }
 
@@ -258,17 +256,8 @@
           xhr.onload = function () {
             if (xhr.status >= 200 && xhr.status < 300 && xhr.response) {
               var fileBlob = xhr.response;
-              window._midiBlob = fileBlob; // expose for native audio
-              window._midiName = fname;
-              if (_isJsonName(fname)) {
-                // .note/.json MIDI — PFA2 binary streams from disk, else restore
-                // the legacy JSON text path.
-                _openNoteFile(fileBlob, fname, _foregroundAfterActivity);
-                return;
-              }
-              // Route MIDI blob (large files skip the full ArrayBuffer read)
-              _routeMidiBlob(fileBlob, fname);
-              _foregroundAfterActivity();
+              _routeHotBlob(fileBlob, fname);
+              return;
             } else {
               console.error('[Main] XHR fetch failed', xhr.status);
               hideParsing();
@@ -299,6 +288,40 @@
 
   function boot() {
     console.log('[Main] boot: DOMContentLoaded; canvas exists?', !!document.getElementById('main-canvas'));
+
+    // ── App Launch Loading Screen (init.png + log + % + progress bar) ──
+    var bootDlg = document.getElementById('app-boot-dialog');
+    var bootSubtitleEl = document.getElementById('app-boot-subtitle');
+    var bootListEl = document.getElementById('app-boot-list');
+    var bootBarEl = document.getElementById('app-boot-bar');
+    var bootPctEl = document.getElementById('app-boot-percent');
+
+    function updateBootProgress(pct, logMsg, detailLog) {
+      var val = Math.min(100, Math.max(0, Math.round(pct)));
+      if (bootBarEl) bootBarEl.style.width = val + '%';
+      if (bootPctEl) bootPctEl.textContent = val + '%';
+
+      var showLog = false;
+      try {
+        var st = (typeof Store !== 'undefined' && Store.getState) ? Store.getState() : null;
+        if (st && (st.verboseInit || st.verboseLoadLog)) showLog = true;
+      } catch (e) {}
+
+      if (bootSubtitleEl) {
+        bootSubtitleEl.textContent = logMsg || '';
+        bootSubtitleEl.style.display = (showLog && logMsg) ? 'block' : 'none';
+      }
+      if (bootListEl) {
+        bootListEl.textContent = detailLog || '';
+        bootListEl.style.display = (showLog && detailLog) ? 'block' : 'none';
+      }
+    }
+
+    if (bootDlg) {
+      bootDlg.classList.remove('hidden');
+      updateBootProgress(5, L10n.t('boot_app_core', 'Initializing App Core...'), '');
+    }
+
     // Boot-time storage log: distinguish internal vs removable SD card
     // (used by the incremental .note writer). Does not block boot.
     try { if (typeof StorageSel !== 'undefined' && StorageSel.log) StorageSel.log(); } catch (e) {}
@@ -489,8 +512,27 @@
     // HUD and controls can ask it for voices without knowing the concrete
     // engine.
     _activeEngine = Synth; // default engine until Settings.load() runs
+    // Isolated engine routing — single funnel for every noteOn. The Sound
+    // Engine SETTING picks exactly one voice renderer: soundbank only when
+    // selected AND loaded (a bank loading mid-song never hijacks the
+    // timbre). The engines own their voices independently; switching
+    // reroutes new notes while old tails decay naturally, so there is no
+    // gap, click or restart. noteOff stays broadcast (next callback), which
+    // is a safe no-op on engines holding no such voice.
+    function _routeNoteToEngine(note, ch, vel, delay, dur) {
+      var useBank = false;
+      try {
+        useBank = (Store.getState().engine === 'soundbank') &&
+                  (typeof Soundbank !== 'undefined' && Soundbank.isReady && Soundbank.isReady());
+      } catch (e) {}
+      if (useBank) {
+        try { Soundbank.play(note, vel, delay, dur); } catch (e2) {}
+      } else {
+        _engine().noteOn(note, ch, vel, delay, dur);
+      }
+    }
     Sequencer.noteDown(function (note, ch, vel, delay, dur) {
-      _engine().noteOn(note, ch, vel, delay, dur);
+      _routeNoteToEngine(note, ch, vel, delay, dur);
       // Feed NoteBuffer for O(1) render
     var st = Store.getState();
 
@@ -528,143 +570,178 @@
     // Settings: load persisted values, push to Store, apply theme.
     // Order matters: Settings.load() must run BEFORE the first frame so
     // the renderer's theme-aware fillStyle picks up the right background.
+    updateBootProgress(25, L10n.t('boot_settings', 'Loading Settings & Preferences...'), '');
     try {
       if (typeof Settings !== 'undefined' && Settings.load) {
         console.log('[Main] calling Settings.load(), Settings=', typeof Settings);
         Settings.load();
-        console.log('[Main] Settings.load done; theme=', Store.getState().theme);
       }
-    } catch (e) {
-      console.error('[Main] settings.load failed', e);
-    }
+    } catch (e) { console.error('[Main] settings.load failed', e); }
 
-    // Developer → On-screen verbose status: restore the persisted toggle.
     try { pfaSetDevOsd(!!Store.getState().osdLog); } catch (e) {}
 
-    // Restore the soundfont banks registry (localStorage) at boot so the
-    // Synth → Load Soundfont list and layered playback survive restarts.
-    // Runs after Settings.load() so the persisted engine ('soundbank')
-    // is already in Store when the first notes try to play.
+    // Desktop-notification permission: must be requested while foregrounded
+    // so the background "Now playing" notification persists in the panel.
+    try { _ensureNotifPermission(); } catch (e) {}
+
+    // KaiAds: preload an ad at boot and wire the pause/resume hooks so a
+    // fullscreen ad pauses playback underneath (KaiAds best practice #3).
     try {
-      if (typeof Soundbank !== 'undefined' && Soundbank.restore) {
-        Soundbank.restore();
-      }
-    } catch (e) { console.error('[Main] Soundbank.restore failed', e); }
-
-    // System → Auto Full Screen / Auto Rotate on launch (reads the Sys
-    // toggles Settings.load() just pushed into Store).
-    try {
-      if (typeof window.applySystemSettings === 'function') window.applySystemSettings();
-    } catch (e) { console.error('[Main] applySystemSettings failed', e); }
-
-    // Restore a persisted background image (survives app restarts) — must
-    // run after Settings.load() seeded Store. The render loop hides it for
-    // the demo lock exactly like bgColor. If the saved image won't load
-    // (corrupt/truncated entry) OR its source file was deleted / renamed
-    // / moved, raise a DIALOG immediately at launch and drop the broken
-    // entry so it can't silently sit there every boot.
-    try {
-      var _st0 = Store.getState();
-      if (_st0 && _st0.bgImageUrl && typeof window.pfaSetBgImage === 'function') {
-        window.pfaSetBgImage(_st0.bgImageUrl, reportBgImageMissing);
-      }
-      if (_st0 && _st0.bgImagePath && typeof checkBgImageFile === 'function') {
-        try { checkBgImageFile(_st0.bgImagePath, reportBgImageMissing); }
-        catch (eF) { console.error('[Main] bg image check failed', eF); }
-      }
-    } catch (e) { console.error('[Main] restore bgImage failed', e); }
-
-    // Softkey labels — let controls.js manage them
-    if (typeof updateSoftkeys === 'function') updateSoftkeys();
-
-    // Error dialog (single OK) keyboard/click wiring
-    bindErrorDialogControls();
-
-    // Hide/restore the parse indicator when the user opens/closes any
-    // overlay (Options, MIDI-OUT settings, Visual settings, About) while
-    // an analysis is running — the indicator only ever lives on the piano.
-    try {
-      var _ovIds = ['menu-overlay', 'settings-overlay', 'subsettings-overlay', 'about-overlay'];
-      if (typeof MutationObserver !== 'undefined') {
-        var _ovMo = new MutationObserver(function () {
-          try { _reconcileParseIndicator(); } catch (e) {}
-        });
-        for (var _ovI = 0; _ovI < _ovIds.length; _ovI++) {
-          var _ovEl = document.getElementById(_ovIds[_ovI]);
-          if (_ovEl) _ovMo.observe(_ovEl, { attributes: true, attributeFilter: ['class'] });
+      if (typeof KaiAds !== 'undefined') {
+        if (typeof KaiAds.setPauseHooks === 'function') {
+          KaiAds.setPauseHooks(_adPausePlayback, _adResumePlayback);
         }
+        if (typeof KaiAds.init === 'function') KaiAds.init();
       }
     } catch (e) {}
 
-    // Start render loop
-    lastFrameTime = performance.now();
-    renderLoop(performance.now());
+    // Preload-media <audio> element: create it early so its 'content'
+    // channel is claimed before any playback (see _ensureMediaEl).
+    try { _ensureMediaEl(); } catch (e) {}
 
-    // Init NoteBuffer with screen dimensions
-    if (typeof NoteBuffer !== 'undefined') {
-      NoteBuffer.init(width, height);
-      NoteBuffer.ensureKeyCache(Store.getState().kbStart || 21,
-                                Store.getState().keyWidth || 16);
-    }
-    console.log('[Main] booted. Canvas ' + width + 'x' + height);
+    // Soundfont restoration or module loading stage (50% -> 85%)
+    var _sfBootErrors = null;
+    var bootSfPromise = new Promise(function (resolve) {
+      updateBootProgress(50, L10n.t('boot_audio_engine', 'Initializing Audio Engine...'), '');
+      try {
+        var st = Store.getState();
+        var isAudioOn = (st && st.audio !== false);
 
-    // KaiAds fullscreen integration (no-op when the SDK is unavailable:
-    // desktop browser / simulator / missing ads-sdk dependency).
-    try {
-      if (typeof KaiAds !== 'undefined' && KaiAds) {
-        KaiAds.setPauseHooks(function () {
-          var _adSt = Store.getState();
-          if (_adSt.play === 'play' && typeof Sequencer !== 'undefined' && Sequencer.pause) {
-            try { Sequencer.pause(); } catch (e) {}
-            Store.setState({ play: 'pause' });
+        if (isAudioOn && typeof Soundbank !== 'undefined' && Soundbank.restore) {
+          var entries = (typeof Soundbank.readRegistry === 'function') ? Soundbank.readRegistry() : [];
+          if (entries && entries.length > 0) {
+            updateBootProgress(50, L10n.t('boot_soundfonts', 'Loading module: Soundfonts'), L10n.t('boot_prep_banks', 'Preparing banks...'));
+            Soundbank.restore(function (sfPct, sfItemLog) {
+              var mappedPct = 50 + Math.round((sfPct / 100) * 35);
+              updateBootProgress(mappedPct, L10n.t('boot_soundfonts', 'Loading module: Soundfonts'), sfItemLog ? (L10n.t('loading_prefix', 'Loading: ') + sfItemLog) : '');
+            }).then(function (res) {
+              if (res && res.failed && res.failed.length > 0) {
+                _sfBootErrors = res.failed;
+              }
+              resolve();
+            }).catch(function () {
+              resolve();
+            });
+            return;
           }
-        }, function () {});
-        KaiAds.init();
-        window.setTimeout(function () {
-          try { if (KaiAds && KaiAds.launch) KaiAds.launch(); } catch (e) {}
-        }, 2500);
-      }
-    } catch (e) {
-      console.warn('[Main] KaiAds init failed', e);
-    }
-
-    // If MozActivity fired while we were still booting (script parse
-    // raced ahead of the DOMContentLoaded handler), flush the queued
-    // payload now that canvas + Synth are wired.
-    if (_pendingActivity) {
-      var p = _pendingActivity;
-      _pendingActivity = null;
-      _gateHotOpen(function () {
-        console.log('[Main] flushing pending activity: blob?', !!p.blob, 'name=', p.name);
-        if (p.blob) {
-          handlePickedBlob(p.blob, p.name || 'picked.mid');
-        } else if (p.filepath) {
-          fetchAndLoad(p.filepath, p.name || p.filepath.split('/').pop() || 'picked.mid');
         }
-      });
-    } else {
-      // No real file was opened this boot — play the bundled demo track
-      // (runs exactly once, ends without looping; see startDemo).
-      startDemo();
-    }
+      } catch (e) { console.error('[Main] Soundbank.restore failed', e); }
+      // Fast path if soundbanks aren't loaded: simulate brief progress step
+      setTimeout(function () {
+        updateBootProgress(75, L10n.t('boot_audio_engine', 'Initializing Audio Engine...'), L10n.t('boot_synth_ready', 'Synth ready'));
+        resolve();
+      }, 100);
+    });
+
+    bootSfPromise.then(function () {
+      try {
+        if (typeof Soundbank !== 'undefined' && Soundbank.setVoices &&
+            Store.getState() && Store.getState().sfVoices != null) {
+          Soundbank.setVoices(Store.getState().sfVoices);
+        }
+      } catch (e) {}
+
+      try {
+        if (typeof window.applySystemSettings === 'function') window.applySystemSettings();
+      } catch (e) {}
+
+      try {
+        var _st0 = Store.getState();
+        if (_st0 && _st0.bgImageUrl && typeof window.pfaSetBgImage === 'function') {
+          window.pfaSetBgImage(_st0.bgImageUrl, reportBgImageMissing);
+        }
+        if (_st0 && _st0.bgImagePath && typeof checkBgImageFile === 'function') {
+          try { checkBgImageFile(_st0.bgImagePath, reportBgImageMissing); }
+          catch (eF) {}
+        }
+      } catch (e) {}
+
+      if (typeof updateSoftkeys === 'function') updateSoftkeys();
+      bindErrorDialogControls();
+
+      updateBootProgress(90, L10n.t('boot_display', 'Initializing Display & Canvas...'), '');
+      lastFrameTime = performance.now();
+      renderLoop(performance.now());
+
+      if (typeof NoteBuffer !== 'undefined') {
+        NoteBuffer.init(width, height);
+        try { window._pfaMn = 'main-30fps-01'; } catch (eV) {}
+        var _bootSt = Store.getState();
+        var _bootdr = (typeof Notes !== 'undefined' && Notes.dynRange)
+          ? Notes.dynRange(_bootSt) : { start: null, end: null };
+        NoteBuffer.ensureKeyCache((_bootdr.start != null) ? _bootdr.start : (_bootSt.kbStart || 21),
+                                  _bootSt.keyWidth || 16);
+      }
+
+      updateBootProgress(100, L10n.t('boot_ready', 'Ready'), '');
+
+      setTimeout(function () {
+        if (bootDlg) bootDlg.classList.add('sf-loading-fade-out');
+
+        // Wait for fade-out animation to finish completely (400ms) before starting demo
+        setTimeout(function () {
+          if (bootDlg) {
+            bootDlg.classList.add('hidden');
+            bootDlg.classList.remove('sf-loading-fade-out');
+          }
+
+          if (_sfBootErrors && _sfBootErrors.length > 0) {
+            var errList = _sfBootErrors.map(function (n) { return '• ' + n; }).join('\n');
+            var errMsgs = 'Failed to load SoundFont(s) (file moved, deleted, or corrupted):\n' + errList;
+            _sfBootErrors = null;
+            if (typeof showErrorDialog === 'function') {
+              showErrorDialog(errMsgs, null, 'Error');
+            }
+          }
+
+          if (_pendingActivity) {
+            var p = _pendingActivity;
+            _pendingActivity = null;
+            _gateHotOpen(function () {
+              if (p.blob) {
+                handlePickedBlob(p.blob, p.name || 'picked.mid');
+              } else if (p.filepath) {
+                fetchAndLoad(p.filepath, p.name || p.filepath.split('/').pop() || 'picked.mid');
+              }
+            });
+          } else {
+            startDemo();
+          }
+          // KaiAds: show the launch fullscreen ad once the app is ready
+          // (best practice — at launch and/or after a completed session).
+          try { if (typeof KaiAds !== 'undefined' && KaiAds.launch) KaiAds.launch(); } catch (e) {}
+        }, 400);
+      }, 100);
+    });
   }
 
   // Pulled out of inline handler so boot() can call it on the queued
   // payload. Same logic as the picker path in controls.js.
   function handlePickedBlob(blob, name) {
     _activityBusy = true;
+    var placeholder = !name;
+    if (placeholder) name = 'picked.mid';
     showParsing(_parsingLabel(name)); // Reading Data... for .note/.json
     Store.setState({ fileName: name });
     window._midiBlob = blob; // expose for native audio + debug
     window._midiName = name;
     if (_isJsonName(name)) {
-      var readerT = new FileReader();
-      readerT.onload = function () { loadMIDIJson(readerT.result); };
-      readerT.onerror = function () { console.error('[Main] FileReader error'); hideParsing(); };
-      readerT.readAsText(blob);
+      // PFA2 binary streams from disk; legacy JSON text restores.
+      // (Never readAsText+JSON.parse directly — binary would die here.)
+      _openNoteFile(blob, name);
       return;
     }
-    _routeMidiBlob(blob, name);
+    var ln = String(name).toLowerCase();
+    if (!placeholder && (ln.endsWith('.mid') || ln.endsWith('.midi'))) {
+      _routeMidiBlob(blob, name);
+      return;
+    }
+    // No trustworthy extension (queued hot-open defaults the name):
+    // sniff content like the live activity path does.
+    _sniffBlobKind(blob).then(function (kind) {
+      if (kind === 'note' || kind === 'json') _openNoteFile(blob, name);
+      else _routeMidiBlob(blob, name);
+    });
   }
 
   function fetchAndLoad(filepath, name) {
@@ -678,7 +755,14 @@
     xhr.onload = function () {
       if (xhr.status >= 200 && xhr.status < 300 && xhr.response) {
         try {
-          _routeMidiBlob(xhr.response, name);
+          var fb = xhr.response;
+          if (_isJsonName(name)) { _openNoteFile(fb, name); return; }
+          var fln = String(name).toLowerCase();
+          if (fln.endsWith('.mid') || fln.endsWith('.midi')) { _routeMidiBlob(fb, name); return; }
+          _sniffBlobKind(fb).then(function (kind) {
+            if (kind === 'note' || kind === 'json') _openNoteFile(fb, name);
+            else _routeMidiBlob(fb, name);
+          });
         } catch (e) {
           console.error('[Main] XHR MIDI parse error', e);
           hideParsing();
@@ -782,7 +866,12 @@
     var bar  = document.getElementById('parse-bar');
     var fill = document.getElementById('parse-bar-fill');
     var pctE = document.getElementById('parse-pct');
-    if (fill) fill.style.background = _loadBarColor();
+    var bootBar = document.getElementById('app-boot-bar');
+    var sfBar = document.getElementById('sf-loading-bar');
+    var color = _loadBarColor();
+    if (fill) fill.style.background = color;
+    if (bootBar) bootBar.style.background = color;
+    if (sfBar) sfBar.style.background = color;
     if (pctE) pctE.style.color = _pctColor();
     if (bar) {
       // The strip appears ONLY while a MIDI/.note file is actually being
@@ -828,6 +917,29 @@
    * that has almost none to spare). Smaller files are read fully for playback.
    */
   function _routeMidiBlob(blob, name) {
+    // Integrated source is set up post-load (RAM parse / conversion done),
+    // never here: snapshotting at pick time made the platform element decode
+    // the MIDI all through analyzing for nothing.
+    // Hot-open may hand us a bare ArrayBuffer (no Blob): wrap it so size,
+    // slice and stream paths all work instead of throwing in FileReader.
+    if (blob && !blob.size && blob.byteLength) {
+      try { blob = new Blob([blob]); } catch (eB) {}
+    }
+    // Track the source size for the big-MIDI guard (Blob or buffer alike).
+    try { window._srcMidiBytes = (blob && (blob.size || blob.byteLength)) || 0; } catch (eS) {}
+    // Big MIDI picked while on Integrated: switch to preload right away
+    // (full toggle parity so display/values/persist follow). If the demo
+    // lock swallows it, the post-load guard completes the switch instead.
+    try {
+      if (((window._srcMidiBytes || 0) > 1048576) && !_integGuardsOff()) {
+        var _ce = null;
+        try { _ce = Store.getState().synthEngine; } catch (eC) {}
+        if (_ce === 'integrated') {
+          if (typeof Settings !== 'undefined' && Settings.setSynthEngine) Settings.setSynthEngine('preload');
+          else Store.setState({ synthEngine: 'preload' });
+        }
+      }
+    } catch (eI) {}
     if (blob && blob.size >= HUGE_MIDI_BYTES && typeof StreamParser !== 'undefined') {
       _analyzeAndLoadMIDI(null, name, blob);
       return;
@@ -869,7 +981,7 @@
     if (typeof window.updateSoftkeys === 'function') window.updateSoftkeys();
     var textEl = document.getElementById('now-playing-text');
     if (textEl && Store.getState().showDialog !== false) {
-      _setParseText(label || 'Analyzing MIDI Data...');
+      _setParseText(label || L10n.t('analyzing_midi', 'Analyzing MIDI Data...'));
     }
     // No percentage known yet (phase just started) — hide the readout until
     // the first onProgress determinate update arrives.
@@ -945,7 +1057,7 @@
     if (_cancelRequested) return;   // already unwinding
     _cancelRequested = true;
     console.log('[Main] Cancel: cancellation requested — stopping the pipeline');
-    _setParseText('Cancelling...');
+    _setParseText(L10n.t('cancelling', 'Cancelling...'));
     // Ask both engines (only the live one reacts); their onCancel clears the
     // partial tmp files and calls _setPipelineBusy(false) + hideParsing().
     try { if (window.StreamParser && StreamParser.cancel) StreamParser.cancel(); } catch (e) {}
@@ -989,6 +1101,11 @@
    *    for ≥ LARGE_MIDI_BYTES).
    */
   function _analyzeAndLoadMIDI(arrayBuffer, name, blob) {
+    // Any real load kills a stale platform source first (demo.mid or a
+    // previous song lingering in the element would otherwise play over the
+    // new visuals when switching back to Integrated later). Fresh sources
+    // are (re)built post-parse/post-conversion where allowed.
+    try { if (typeof _integRelease === 'function') _integRelease(); } catch (eR) {}
     var bSize = (blob && blob.size !== undefined) ? blob.size : (arrayBuffer ? arrayBuffer.byteLength : 0);
     try { if (performance && performance.memory) console.log('[Heap] _analyzeAndLoadMIDI enter heapKB=' + Math.round(performance.memory.usedJSHeapSize / 1024) + ' bSize=' + bSize); } catch (e) {}
     console.log('[Main] _analyzeAndLoadMIDI name=' + name + ' blob=' + !!blob + ' bSize=' + bSize + ' hugeThresh=' + HUGE_MIDI_BYTES);
@@ -1005,42 +1122,54 @@
       return;
     }
 
-    if (bSize >= HUGE_MIDI_BYTES && blob && typeof StreamParser !== 'undefined') {      _showParseProgress('Parsing MIDI data...', true);
+    if (bSize >= HUGE_MIDI_BYTES && blob && typeof StreamParser !== 'undefined') {      _showParseProgress(L10n.t('parsing_midi_data', 'Parsing MIDI data...'), true);
       console.log('[StreamParser] huge MIDI ' + bSize + ' bytes → stream to binary .note (no RAM play)');
       _setPipelineBusy(true);
       StreamParser.midiToNote(blob, name, {
         onStage: function (s) {
-          if (s === 'parse') { _pctStage = 'parse'; _showParseProgress('Parsing MIDI data...', true); }
-          else if (s === 'merge') { _pctStage = 'merge'; _showParseProgress('Merging events...', false); }
+          if (s === 'parse') { _pctStage = 'parse'; _showParseProgress(L10n.t('parsing_midi_data', 'Parsing MIDI data...'), true); }
+          else if (s === 'merge') { _pctStage = 'merge'; _showParseProgress(L10n.t('merging_events', 'Merging events...'), false); }
         },
         onProgress: function (pct) { _updateParseProgress(pct); },
         onDone: function (path) {
           console.log('[StreamParser] wrote ' + path);
           window._midiNotePath = path;
           // Free the source MIDI Blob now that the .note is written and we're
-          // about to stream it back from disk. Nothing consumes _midiBlob /
-          // _rawMidiBuffer (they're only exposed "for native audio" that is
-          // never wired up), so keeping them just pins ~25MB in RAM per load.
-          window._midiBlob = null;
-          window._rawMidiBuffer = null;
+          // about to stream it back from disk — UNLESS Integrated is selected
+          // (and the file isn't big): the platform element needs the bytes,
+          // and it is set up here (post conversion, never during analyze) so
+          // no background decode runs while converting. Big files switch to
+          // preload at open instead (helper below) — no URL, no pin — unless
+          // the kill-switch is ON (big decodes allowed again).
+          var keepBlob = false;
+          try { keepBlob = (Store.getState().synthEngine === 'integrated') && (!(blob && blob.size > 1048576) || _integGuardsOff()); } catch (e) {}
+          if (keepBlob && blob) {
+            window._midiBlob = blob;
+            try { if (typeof _integSetSource === 'function') _integSetSource(blob); } catch (e2) {}
+          } else {
+            window._midiBlob = null;
+            window._rawMidiBuffer = null;
+          }
           // _pipelineBusy stays true until the stream playback is open, so an
           // app close exactly at this boundary can't wipe the file out from
           // under the reader. Do NOT loadMIDIData (would OOM) — stream the
           // binary .note back from disk instead.
           _openConvertedNote(path, name).then(
-            function () { _setPipelineBusy(false); },
-            function () { _setPipelineBusy(false); }
+            function () { _setPipelineBusy(false); _notifyAnalyzeDone(name); },
+            function () { _setPipelineBusy(false); _notifyAnalyzeGone(); }
           );
         },
         onError: function (msg) {
           console.error('[StreamParser] ' + msg);
           _setPipelineBusy(false);
+          _notifyAnalyzeGone();
           hideParsing();
           if (typeof showErrorDialog === 'function') {
-            try { showErrorDialog('Streaming MIDI analysis failed: ' + msg); } catch (e) {}
+            try { showErrorDialog(L10n.t('err_stream_failed', 'Streaming MIDI analysis failed: ') + msg); } catch (e) {}
           }
         },
         onCancel: function (msg) {
+          _notifyAnalyzeGone();
           _onAnalyzeCancelled(msg);
         }
       });
@@ -1049,6 +1178,16 @@
 
     var midiData = MidiParser.parseMIDI(arrayBuffer);
     window._rawMidiBuffer = arrayBuffer;
+    // Integrated source, deferred to post-parse (never during analyze): the
+    // platform element first touches the MIDI once the song is loaded.
+    // Big files (>1MB) skip it here — they auto-switch to preload at load
+    // (unless the kill-switch is ON, which allows big decodes again).
+    try {
+      if (Store.getState().synthEngine === 'integrated' && blob && blob.size && (!(blob.size > 1048576) || _integGuardsOff()) && typeof _integSetSource === 'function') {
+        window._midiBlob = blob;
+        _integSetSource(blob);
+      }
+    } catch (e) {}
 
     var isLarge = arrayBuffer.byteLength >= LARGE_MIDI_BYTES;
     if (!isLarge || typeof NoteWriter === 'undefined') {
@@ -1070,6 +1209,7 @@
         _setPipelineBusy(false);
         hideParsing();
         loadMIDIData(midiData);
+        _notifyAnalyzeDone(name);
       },
       onError: function (msg) {
         console.error('[NoteWriter] ' + msg);
@@ -1079,14 +1219,416 @@
         // dialog is already on screen (OK → exit). Do NOT fall back to
         // playback behind the dialog.
         if (typeof storageGranted === 'function') {
-          try { if (storageGranted()) { loadMIDIData(midiData); return; } } catch (e) { loadMIDIData(midiData); return; }
+          try { if (storageGranted()) { loadMIDIData(midiData); _notifyAnalyzeDone(name); return; } } catch (e) { loadMIDIData(midiData); _notifyAnalyzeDone(name); return; }
         }
         loadMIDIData(midiData); // still play even if the copy failed
+        _notifyAnalyzeDone(name);
       },
       onCancel: function (msg) {
+        _notifyAnalyzeGone();
         _onAnalyzeCancelled(msg);
       }
     });
+  }
+
+
+  // ── PRELOAD MEDIA (Synth Engine = preload) ──
+  // A media file (mp3/audio) plays alongside the MIDI, synced to the
+  // transport: play/pause/stop, ±1s seek, and playback rate all follow.
+  var _mediaEl = null;
+  var _mediaTimer = null;
+  var _mediaUrl = null;
+  var _mediaErrShown = false;
+  var _mediaStopped = true; // true = next play restarts at 0 (fresh start)
+
+  function _ensureMediaEl() {
+    if (_mediaEl) return _mediaEl;
+    try {
+      _mediaEl = document.createElement('audio');
+      // KaiOS: a media element must claim the 'content' (media) channel
+      // BEFORE it enters the DOM — otherwise it defaults to the notification
+      // channel (volume OSD shows "Ringtones and Alerts" and the track can
+      // be silent). Set it both ways to cover Gecko quirks.
+      try { _mediaEl.mozAudioChannelType = 'content'; } catch (e) {}
+      try { _mediaEl.setAttribute('mozAudioChannelType', 'content'); } catch (e) {}
+      _mediaEl.preload = 'none'; // don't probe/load anything at boot
+      _mediaEl.addEventListener('error', function () {
+        try { console.warn('[Media] element error', _mediaEl.error ? _mediaEl.error.code : '?'); } catch (e) {}
+        // Only surface a dialog when a real media file was loaded AND is
+        // being played — ignore spurious idle/boot errors.
+        if (_mediaErrShown || !_mediaActive()) return;
+        _mediaErrShown = true;
+        try {
+          if (typeof window.showErrorDialog === 'function') {
+            window.showErrorDialog(L10n.t('err_media_unsupported', 'This media format is not supported by the device. Try an MP3 / WAV / M4A file.'));
+          }
+        } catch (e) {}
+      });
+      _mediaEl.addEventListener('playing', function () { console.log('[Media] playing'); });
+      document.body.appendChild(_mediaEl);
+      _assertMediaChannel();
+      // A NEW element starts unmuted. Apply the current Audio Output state
+      // here so it inherits a persisted "off" at boot — the store-diff in
+      // onStoreChange may have run before this element existed (boot order),
+      // leaving the fresh element permanently audible until a manual toggle.
+      _mediaApplyMute();
+    } catch (e) {}
+    return _mediaEl;
+  }
+
+  /** Point the OS volume rocker / OSD at the media ('content') channel. */
+  function _assertMediaChannel() {
+    try {
+      var acm = navigator.mozAudioChannelManager || navigator.audioChannelManager;
+      if (acm && typeof acm.volumeControlChannel === 'string') {
+        acm.volumeControlChannel = 'content';
+      }
+    } catch (e) {}
+  }
+
+  function _mediaActive() {
+    var st = Store.getState();
+    return !!(st.synthEngine === 'preload' && st.mediaSrc);
+  }
+
+  function _mediaApplyMute() {
+    var st = Store.getState();
+    var on = (st.audio !== false);
+    if (_mediaEl) { try { _mediaEl.muted = !on; } catch (e) {} }
+  }
+
+  function _mediaPlay() {
+    if (!_mediaActive()) return;
+    // A delayed (Media Delay) start is already pending — don't cancel it.
+    // This happens when the Start Delay countdown ends while the media was
+    // already started independently at Play time.
+    if (_mediaTimer) return;
+    var el = _ensureMediaEl();
+    if (!el) return;
+    var st = Store.getState();
+    var src = st.mediaSrc;
+    try {
+      if (el.src !== src) { el.src = src; el.load(); }
+    } catch (e) {}
+    clearTimeout(_mediaTimer); _mediaTimer = null;
+    _mediaApplyMute();
+    _mediaErrShown = false;
+    _assertMediaChannel();
+    try { console.log('[Media] ch=' + (el.mozAudioChannelType || '?') + ' muted=' + el.muted); } catch (e) {}
+    var delay = Math.max(0, Number(st.mediaDelay) || 0);
+    var kick = function () {
+      _mediaTimer = null; // fired (or firing now) — no longer pending
+      try {
+        var p = el.play();
+        if (p && p.catch) p.catch(function (er) { console.warn('[Media] play blocked:', er); });
+        else console.log('[Media] play() ok');
+      } catch (e) { console.warn('[Media] play() threw:', e); }
+    };
+    // A FRESH start (from Stop) restarts the media at 0 and applies the
+    // delay. Resuming from Pause keeps the current position and plays
+    // immediately — no rewind, no re-applied delay.
+    var fresh = _mediaStopped;
+    _mediaStopped = false;
+    if (fresh) {
+      try { el.currentTime = 0; } catch (e) {}
+      if (delay > 0) {
+        _mediaTimer = setTimeout(kick, delay * 1000);
+      } else {
+        kick();
+      }
+    } else {
+      kick();
+    }
+  }
+
+  function _mediaPause() {
+    clearTimeout(_mediaTimer); _mediaTimer = null;
+    if (_mediaEl) { try { _mediaEl.pause(); } catch (e) {} }
+  }
+
+  function _mediaStop() {
+    clearTimeout(_mediaTimer); _mediaTimer = null;
+    _mediaStopped = true;
+    if (_mediaEl) {
+      try { _mediaEl.pause(); _mediaEl.currentTime = 0; } catch (e) {}
+    }
+  }
+
+  // Full release (Clear Media): stop, drop the src and free the blob URL.
+  function _mediaRelease() {
+    clearTimeout(_mediaTimer);
+    _mediaStopped = true;
+    if (_mediaEl) {
+      try {
+        _mediaEl.pause();
+        _mediaEl.removeAttribute('src');
+        _mediaEl.load();
+      } catch (e) {}
+    }
+    if (_mediaUrl) {
+      try { URL.revokeObjectURL(_mediaUrl); } catch (e) {}
+      _mediaUrl = null;
+    }
+  }
+
+  function _mediaSeek(delta) {
+    if (!_mediaEl || !_mediaActive()) return;
+    try {
+      var nt = (_mediaEl.currentTime || 0) + (Number(delta) || 0);
+      if (nt < 0) nt = 0;
+      var mx = _mediaEl.duration;
+      if (isFinite(mx) && mx > 0 && nt > mx) nt = mx;
+      _mediaEl.currentTime = nt;
+    } catch (e) {}
+  }
+
+  function _mediaSetSpeed(sp) {
+    if (!_mediaEl) return;
+    try { _mediaEl.playbackRate = (sp && sp > 0) ? sp : 1.0; } catch (e) {}
+  }
+
+  window._mediaSeek = _mediaSeek; // hook for controls.js seekSeconds
+  window.pfaReleaseMedia = _mediaRelease; // hook for Settings "Clear Media"
+
+  // ── Integrated synth engine (platform MIDI audio) ────────────────────
+  // Third Synth Engine choice: the loaded .mid is ALSO handed to a native
+  // <audio> element so the device's own system synthesizer renders it,
+  // while our oscillator/soundbank stay muted (same as preload). PFA2
+  // .note files are NOT platform-playable → silence under Integrated
+  // (the settings note explains this). Transport (play/pause/stop/seek/
+  // speed) mirrors the preload-media hooks; alignment with the visual
+  // playhead is best-effort (no tempo-map resync).
+  var _integEl = null, _integUrl = null, _integStopped = true;
+  // Dev kill-switch (Developer → Disable warnings in integrated): ON disables
+  // the auto-switch and the >1MB check (big decodes allowed again, no forced
+  // preload). Keep-alive across switches is unconditional (pause + kept
+  // source — cheap instant-resume; background decode was killed at its root
+  // by deferred setup, not by releasing here). OFF (default) keeps guards on.
+  function _integGuardsOff() {
+    try { return !!(Store.getState && Store.getState() && Store.getState().disIntegGuard); } catch (e) { return false; }
+  }
+  var _integDemoHold = false, _integHoldTimer = null;
+
+  function _integActive() {
+    var st = Store.getState();
+    return st.synthEngine === 'integrated' && !!_integUrl;
+  }
+  function _ensureIntegEl() {
+    if (_integEl) return _integEl;
+    try {
+      _integEl = document.createElement('audio');
+      try { _integEl.mozAudioChannelType = 'content'; } catch (e) {}
+      try { _integEl.setAttribute('mozAudioChannelType', 'content'); } catch (e) {}
+      _integEl.preload = 'none';
+      _integEl.addEventListener('error', function () {
+        try { console.warn('[Integ] element error', _integEl.error ? _integEl.error.code : '?'); } catch (e) {}
+      });
+      document.body.appendChild(_integEl);
+      _assertMediaChannel();
+      _integApplyMute();
+    } catch (e) {}
+    return _integEl;
+  }
+  function _integApplyMute() {
+    var st = Store.getState();
+    if (_integEl) { try { _integEl.muted = (st.audio === false); } catch (e) {} }
+  }
+  // (Re)build the platform source from a MIDI blob (revokes the old URL).
+  // Also cancels any pending demo pre-roll hold (a real file takes over).
+  function _integSetSource(blob) {
+    _integDemoHold = false;
+    try { if (_integHoldTimer) { clearTimeout(_integHoldTimer); _integHoldTimer = null; } } catch (e) {}
+    _integReleaseUrl();
+    _integStopped = true;
+    if (!blob) return;
+    try {
+      _integUrl = URL.createObjectURL(blob);
+      var el = _ensureIntegEl();
+      if (el) { try { el.src = _integUrl; el.load(); } catch (e) {} }
+    } catch (e) { _integUrl = null; }
+  }
+  function _integReleaseUrl() {
+    if (_integUrl) { try { URL.revokeObjectURL(_integUrl); } catch (e) {} _integUrl = null; }
+  }
+  // Full release (note load, engine switch away, unload).
+  function _integRelease() {
+    _integStopped = true;
+    _integDemoHold = false;
+    try { if (_integHoldTimer) { clearTimeout(_integHoldTimer); _integHoldTimer = null; } } catch (e) {}
+    if (_integEl) {
+      try { _integEl.pause(); _integEl.removeAttribute('src'); _integEl.load(); } catch (e) {}
+    }
+    _integReleaseUrl();
+  }
+  function _integPlay(keepPos) {
+    if (!_integActive()) return;
+    // Demo pre-roll hold (armed by startDemo): the visuals need a head
+    // start, so the element must NOT start with the transport.
+    if (_integDemoHold) return;
+    var el = _ensureIntegEl();
+    if (!el) return;
+    _integApplyMute();
+    // keepPos (engine-switch resync): the caller already positioned the
+    // element — playing must NOT rewind to 0 (that restarted the music).
+    var fresh = _integStopped && !keepPos;
+    _integStopped = false;
+    if (fresh) { try { el.currentTime = 0; } catch (e) {} }
+    try {
+      var p = el.play();
+      if (p && p.catch) p.catch(function (er) { console.warn('[Integ] play blocked:', er); });
+    } catch (e) { console.warn('[Integ] play() threw:', e); }
+  }
+  function _integPause() {
+    _integDemoHold = false;
+    try { if (_integHoldTimer) { clearTimeout(_integHoldTimer); _integHoldTimer = null; } } catch (e) {}
+    if (_integEl) { try { _integEl.pause(); } catch (e) {} }
+  }
+  function _integStop() {
+    _integStopped = true;
+    _integDemoHold = false;
+    try { if (_integHoldTimer) { clearTimeout(_integHoldTimer); _integHoldTimer = null; } } catch (e) {}
+    if (_integEl) { try { _integEl.pause(); _integEl.currentTime = 0; } catch (e) {} }
+  }
+  function _integSeek(delta) {
+    if (!_integEl || !_integActive()) return;
+    try {
+      var nt = (_integEl.currentTime || 0) + (Number(delta) || 0);
+      if (nt < 0) nt = 0;
+      _integEl.currentTime = nt;
+    } catch (e) {}
+  }
+  function _integSetSpeed(sp) {
+    if (!_integEl) return;
+    try { _integEl.playbackRate = (sp && sp > 0) ? sp : 1.0; } catch (e) {}
+  }
+  window._integSeek = _integSeek; // hook for controls.js seekSeconds
+  window._integRelease = _integRelease; // hook for controls.js direct loads
+
+  // Deferred sequencer start for Integrated fresh plays: the platform
+  // element needs a spin-up moment (decode init, ~350ms on weak hardware)
+  // before it is audible, while the sequencer/visuals would start instantly
+  // — a permanent -0.35s-style offset. So the visuals wait for the
+  // element's own 'playing' event (self-calibrating on any device), with a
+  // 2s fallback so a dead element never hangs playback. Pause/stop/load in
+  // between simply no-ops the pending start (play state is re-checked).
+  var _integAwaitTimer = null;
+  function _integFreshPending() {
+    try {
+      return Store.getState().synthEngine === 'integrated' && !!_integUrl && _integStopped;
+    } catch (e) { return false; }
+  }
+  function _integAwaitPlaying() {
+    try { if (_integAwaitTimer) clearTimeout(_integAwaitTimer); } catch (e) {}
+    var done = false;
+    var t0 = 0;
+    try { t0 = performance.now(); } catch (e) {}
+    function go() {
+      if (done) return; done = true;
+      try { if (_integEl) _integEl.removeEventListener('playing', onPlaying); } catch (e) {}
+      try { if (_integAwaitTimer) clearTimeout(_integAwaitTimer); } catch (e) {}
+      _integAwaitTimer = null;
+      try {
+        var st = Store.getState();
+        if (st.play === 'play' && typeof Sequencer !== 'undefined' && Sequencer.play) Sequencer.play();
+      } catch (e2) {}
+    }
+    function onPlaying() {
+      if (done) return;
+      // Fast event (<150ms): the platform signaled start long before first
+      // audible output (output latency). Hold visuals until ~350ms
+      // post-press so they meet the sound (measured startup lag on the
+      // reference device; tune per hardware if needed). Slow event: the
+      // spin-up itself dominated — start visuals at once.
+      var el = 0;
+      try { el = performance.now() - t0; } catch (e) {}
+      if (el < 150) {
+        var wait = 350 - el;
+        if (wait < 0) wait = 0;
+        try { if (_integAwaitTimer) clearTimeout(_integAwaitTimer); } catch (e) {}
+        try { _integAwaitTimer = setTimeout(go, wait); } catch (e) { go(); }
+      } else {
+        go();
+      }
+    }
+    try {
+      if (_integEl) _integEl.addEventListener('playing', onPlaying);
+    } catch (e) {}
+    try { _integAwaitTimer = setTimeout(go, 2000); } catch (e) {}
+  }
+
+  /** Accepted media extensions (blob.type may be empty on KaiOS). */
+  function _isMediaFile(blob, name) {
+    var t = (blob && blob.type) ? String(blob.type).toLowerCase() : '';
+    if (t.indexOf('audio/') === 0) return true;
+    if (t.indexOf('video/') === 0) return true;
+    var ext = String(name || '').split('.').pop().toLowerCase();
+    return ['mp3','wav','ogg','oga','m4a','aac','amr','opus','flac','3gp','mp4','m4v'].indexOf(ext) !== -1;
+  }
+
+  // Load / Change Media (Synth Settings → Preload): same MozActivity picker
+  // as the MIDI loader, but validates the pick is an audio/media file.
+  // The settings overlay stays OPEN so the user lands back here (not the
+  // piano) with the fresh file name / Change Media label visible.
+  window.launchMediaPicker = function () {
+    // Exit fullscreen first so the MozActivity picker can cover the screen
+    // properly (same as the MIDI loader does).
+    try {
+      var _fsApp = document.getElementById('app');
+      if (_fsApp && _fsApp.classList.contains('fullscreen')) {
+        _fsApp.classList.remove('fullscreen');
+        if (document.exitFullscreen) document.exitFullscreen();
+        else if (document.mozCancelFullScreen) document.mozCancelFullScreen();
+        setTimeout(function () { try { if (typeof onResize === 'function') onResize(); } catch (e) {} }, 100);
+      }
+    } catch (e) {}
+    try {
+      window._pickerOpen = true;
+      var act = new MozActivity({ name: 'pick' });
+      act.onsuccess = function (res) {
+        window._pickerOpen = false;
+        var blob = null;
+        if (res.target && res.target.result) blob = res.target.result.blob || res.target.result;
+        else if (res.result && res.result.blob) blob = res.result.blob;
+        else if (res.blob) blob = res.blob;
+        else if (res instanceof Blob) blob = res;
+        if (!blob) return;
+        var name = String(blob.name || 'media').split('/').pop();
+        if (_isMediaFile(blob, name)) {
+          var url = URL.createObjectURL(blob);
+          try { if (_mediaUrl) URL.revokeObjectURL(_mediaUrl); } catch (e) {}
+          _mediaUrl = url;
+          _mediaErrShown = false;
+          if (typeof Settings !== 'undefined' && Settings.setMedia) {
+            try { Settings.setMedia(name, url); } catch (e) {}
+          }
+          Store.setState({ mediaName: name, mediaSrc: url });
+          if (typeof Settings !== 'undefined' && Settings.refreshMidiGroup) {
+            try { Settings.refreshMidiGroup(); } catch (e) {}
+          }
+        } else {
+          if (typeof window.showErrorDialog === 'function') {
+            try { window.showErrorDialog(L10n.t('err_not_media', 'Not a media file') + ':\n' + name, null, L10n.t('error', 'Error')); } catch (e) {}
+          }
+        }
+      };
+      act.onerror = function () { window._pickerOpen = false; };
+    } catch (e) { window._pickerOpen = false; }
+  };
+
+
+  // ── KaiAds: pause/resume playback while a fullscreen ad covers the app ──
+  // KaiAds best practice #3: content must pause under a fullscreen ad.
+  var _adWasPlaying = false;
+  function _adPausePlayback() {
+    try {
+      _adWasPlaying = (Store.getState().play === 'play');
+      if (_adWasPlaying) Store.setState({ play: 'pause' });
+    } catch (e) {}
+  }
+  function _adResumePlayback() {
+    try {
+      if (_adWasPlaying) { _adWasPlaying = false; Store.setState({ play: 'play' }); }
+    } catch (e) {}
   }
 
 
@@ -1095,6 +1637,7 @@
   var _prevSpeed      = null;
   var _prevWave       = null;
   var _prevAudio      = null;
+  var _prevSynthEngine = null;
   var _prevPctBarVis  = null;
   var _prevLoadAnim   = null;
   var _prevLoadColor  = null;
@@ -1120,12 +1663,41 @@
       // the context; otherwise the first Play would no-op the bootstrap.
       try { if (typeof _engine().setActive === 'function') _engine().setActive(true); } catch (eA) {}
       _engine().ensure();
-      Sequencer.play();
+      // Mute assertion (not just on engine transitions): a persisted/boot
+      // integrated (or preload) that never transitioned would otherwise voice
+      // the pool/soundbank audibly under (or instead of) the platform element.
+      // Idempotent — same values re-applied are a no-op.
+      try {
+        var _preM = false, _auM = true;
+        try { var _stm = Store.getState(); _preM = (_stm.synthEngine === 'preload' || _stm.synthEngine === 'integrated'); } catch (eM) {}
+        try { _auM = Store.getState().audio !== false; } catch (eA2) {}
+        try { _engine().mute(_preM || !_auM); } catch (eMM) {}
+        if (typeof Soundbank !== 'undefined' && Soundbank.mute) { try { Soundbank.mute(_preM || !_auM); } catch (eSM) {} }
+      } catch (eMA) {}
+      // Integrated fresh start: hold the visuals until the platform element
+      // actually sounds (its spin-up lags ~hundreds of ms, otherwise audio
+      // sits permanently behind). _integAwaitPlaying self-calibrates via the
+      // element's own 'playing' event; everything else starts immediately.
+      var _waitAudio = false;
+      try { _waitAudio = _integFreshPending(); } catch (eD) {}
+      if (!_waitAudio) { try { Sequencer.play(); } catch (eP) {} }
+      _mediaPlay();
+      _integPlay();
+      if (_waitAudio) { try { _integAwaitPlaying(); } catch (eA2) {} }
       acquireCpuWakeLock();
       acquireScreenWakeLock();
     } else if (state.play === 'pause' && prevPlay !== 'pause') {
       Sequencer.pause();
       _engine().silence();
+      // Start Delay keeps `play` at 'pause' while the MIDI waits its countdown.
+      // The preload media is an INDEPENDENT track: start it now (its own Media
+      // Delay applies) instead of holding it until the countdown ends.
+      if (state.startCountdown != null) {
+        _mediaPlay();
+      } else {
+        _mediaPause();
+        _integPause();
+      }
       // No audible output → release the status-bar play indicator.
       try { if (typeof _engine().setActive === 'function') _engine().setActive(false); } catch (eA) {}
     } else if (state.play === 'stop' && prevPlay !== 'stop') {
@@ -1136,6 +1708,8 @@
       try { seqEnded = typeof Sequencer !== 'undefined' && Sequencer.isEnded && Sequencer.isEnded(); } catch (e) {}
       if (!seqEnded) { try { Sequencer.stop(); } catch (e) {} }
       _engine().silence();
+      _mediaStop();
+      _integStop();
       // Nothing sounding anymore → suspend AudioContext so the OS status-bar
       // play icon disappears (a latent 'content'-channel context keeps showing
       // "playing" even after the song ends).
@@ -1159,9 +1733,92 @@
     // Audio on/off (Settings → Synth → Audio). _prevAudio guards so the
     // toggle only fires Synth.mute on an actual change (mute() silences
     // instantly; the master gain write is direct, no param events).
+    // NOTE: in preload mode the system synth stays muted regardless of
+    // this toggle — toggling audio only mutes/unmutes the media itself.
     if (state.audio !== _prevAudio) {
       _prevAudio = state.audio;
-      Synth.mute(!state.audio);
+      var _preAudio = (state.synthEngine === 'preload' || state.synthEngine === 'integrated');
+      Synth.mute(_preAudio || !state.audio);
+      _mediaApplyMute();
+      _integApplyMute();
+      // Soundbank routes straight to the context destination, so the master
+      // Audio On/Off toggle must mute it explicitly too (SF engine).
+      if (typeof Soundbank !== 'undefined' && Soundbank.mute) {
+        try { Soundbank.mute(_preAudio || !state.audio); } catch (eM) {}
+      }
+    }
+
+    // Synth Engine (System / Preload / Integrated): preload AND integrated
+    // DISABLE the system synth — only the media file (preload) or the
+    // platform element (integrated) sounds.
+    if (state.synthEngine !== _prevSynthEngine) {
+      // Demo locks the engine to Integrated until a real MIDI/.note file
+      // loads — bounce any mid-demo change straight back (persisted too, so
+      // the settings rows stay truthful). The nested applyVisual runs its
+      // own full round, so this round returns after the bounce.
+      if ((_demoActive || _lockNoFile) && state.synthEngine !== 'integrated') {
+        _prevSynthEngine = state.synthEngine; // swallow this transition
+        try {
+          if (typeof Settings !== 'undefined' && Settings.applyVisual) Settings.applyVisual('synthEngine', 'integrated');
+          else Store.setState({ synthEngine: 'integrated' });
+        } catch (e) {}
+        return;
+      }
+      _prevSynthEngine = state.synthEngine;
+      var _pre = (state.synthEngine === 'preload' || state.synthEngine === 'integrated');
+      try { Synth.mute(_pre || !state.audio); } catch (eS) {}
+      if (typeof Soundbank !== 'undefined' && Soundbank.mute) {
+        try { Soundbank.mute(_pre || !state.audio); } catch (eSB) {}
+      }
+      if (state.synthEngine === 'integrated') {
+        // Resume the platform element if it already carries this file:
+        // only our own code sets its src (cleared on note loads), so a
+        // present src is always current — resync + play, no rebuild gap,
+        // no rewind-to-0 music restart. Otherwise build from a blob.
+        var _hasSrc = false;
+        try { _hasSrc = !!(_integEl && _integEl.src); } catch (eH) {}
+        if (_hasSrc) {
+          if (state.play === 'play') {
+            var _nt2 = 0;
+            try { _nt2 = Sequencer.getTime(); } catch (eT2) {}
+            try { if (_integEl && isFinite(_nt2) && _nt2 > 0) _integEl.currentTime = _nt2; } catch (eC2) {}
+            _integPlay(true);
+          }
+        } else {
+        // Rebuild the platform source if a MIDI is loaded (fileName-gated —
+        // never guess for .note, those stay silent). Best-effort resync when
+        // switching mid-playback: restart the element at the visual time.
+        var _fn = '';
+        try { _fn = String(Store.getState().fileName || ''); } catch (eF) {}
+        if (/\.midi?$/i.test(_fn) || _demoActive) {
+          var _bb = null;
+          try { _bb = window._midiBlob || null; } catch (eB) {}
+          if (!_bb) { try { if (window._rawMidiBuffer) _bb = new Blob([window._rawMidiBuffer]); } catch (eB2) {} }
+          if (_bb) {
+            _integSetSource(_bb);
+            if (state.play === 'play') {
+              var _nt = 0;
+              try { _nt = Sequencer.getTime(); } catch (eT) {}
+              try { if (_integEl && isFinite(_nt) && _nt > 0) _integEl.currentTime = _nt; } catch (eC) {}
+              _integPlay(true);
+            }
+          } else {
+            // No source blob available (e.g. huge file whose buffer was
+            // freed) — silence rather than keep a stale file's audio.
+            _integRelease();
+          }
+        } else {
+          _integRelease();
+        }
+        }
+      } else {
+        // Leaving Integrated: pause only and KEEP the source, so switching
+        // back resumes instantly at the kept position and keeps following the
+        // notes (no re-decode, no background analyze — a paused element does
+        // nothing; the pool/soundbank stay muted by the play assertion).
+        // (A new .mid replaces the source; a .note releases it.)
+        try { if (_integEl) _integEl.pause(); } catch (eP) {}
+      }
     }
 
     // Loading-bar presentation (Visual → Loading Bar): re-apply live when
@@ -1192,6 +1849,8 @@
     if (state.speed != null && state.speed !== _prevSpeed && !_demoActive && !_lockNoFile) {
       _prevSpeed = state.speed;
       Sequencer.setSpeed(state.speed);
+      _mediaSetSpeed(state.speed);
+      _integSetSpeed(state.speed);
     }
 
     // File selected from picker
@@ -1211,8 +1870,15 @@
     // early-return so the HUD FPS stays live during conversions too.
     var dt = now - lastFrameTime;
     lastFrameTime = now;
-    fpsCounter++;
     fpsAcc += dt;
+    // Paint gate (30fps lock): rAF may run at 60Hz while this hardware
+    // sustains ~30fps of frame work — painting every callback doubles all
+    // per-frame cost (lag + heat + GC). Skip painting callbacks arriving
+    // sooner than 33ms after the last painted frame; rAF keeps scheduling
+    // (compositor-friendly) and the FPS readout counts painted frames.
+    if (now - _lastPaintT < 33) return;
+    _lastPaintT = now;
+    fpsCounter++;
     if (fpsAcc >= 1000) {
       Store.setState({ fps: Math.round(fpsCounter * 1000 / fpsAcc) });
       fpsCounter = 0;
@@ -1228,6 +1894,11 @@
     if (_pipelineBusy) return;
 
     var st = Store.getState();
+
+    // Keep keyWidth fitted to the current (possibly dynamic) range every
+    // frame, gliding toward the fit so range flips animate as a smooth
+    // zoom instead of snapping. No-op once converged.
+    try { fitKeyboardWidth(st, dt); } catch (e) {}
 
     // NOTE: keyboard spritesheet rebuilds are handled inside
     // Keyboard.draw() (keyWidth / pianoSize / pianoColorHex trackers),
@@ -1336,9 +2007,13 @@
   // Called from resizeCanvas AND once per frame in renderLoop, so slider
   // edits to Keyboard Range refit immediately no matter which code path
   // wrote kbStart/kbEnd.
-  function fitKeyboardWidth(st) {
-    var rStart = (st.kbStart != null) ? st.kbStart : 21;
-    var rEnd   = (st.kbEnd   != null) ? st.kbEnd   : 108;
+  function fitKeyboardWidth(st, dtMs) {
+    var _fitdr = (typeof Notes !== 'undefined' && Notes.dynRange)
+      ? Notes.dynRange(st) : { start: null, end: null };
+    var rStart = (_fitdr.start != null) ? _fitdr.start
+      : ((st.kbStart != null) ? st.kbStart : 21);
+    var rEnd   = (_fitdr.end != null) ? _fitdr.end
+      : ((st.kbEnd   != null) ? st.kbEnd   : 108);
     // During the demo / locked state, fit width from the FIXED demo range so
     // a saved Keyboard Range can never change the demo's note spacing.
     if (typeof window.demoVisualValue === 'function') {
@@ -1359,7 +2034,21 @@
     var newKeyW = width / whitesInRange;
     newKeyW = Math.max(Constants.UI.KEY_W_MIN,
               Math.min(Constants.UI.KEY_W_MAX, newKeyW));
-    if ((st.keyWidth || 16) !== newKeyW) Store.setState({ keyWidth: newKeyW });
+    var curKW = st.keyWidth || 16;
+    if (curKW === newKeyW) return;
+    // Zoom easing: glide toward the new fit instead of snapping, so a
+    // dynamic range flip (88 ↔ 128) visibly zooms out/in over ~0.4s.
+    // dtMs > 0 eases (per-frame caller); otherwise snap (resize path).
+    if (dtMs > 0) {
+      var kk = 1 - Math.exp(-dtMs / 120);
+      if (kk < 1) {
+        var easedKW = curKW + (newKeyW - curKW) * kk;
+        if (Math.abs(easedKW - newKeyW) < 0.01) easedKW = newKeyW;
+        Store.setState({ keyWidth: easedKW });
+        return;
+      }
+    }
+    Store.setState({ keyWidth: newKeyW });
   }
 
   function resizeCanvas() {
@@ -1478,7 +2167,7 @@
     var text    = document.getElementById('now-playing-text');
     if (!overlay || !text) return;
     var name = (fileName || '').split('/').pop() || 'Unknown';
-    text.textContent = 'Now playing: ' + name;
+    text.textContent = L10n.t('now_playing', 'Now playing') + ': ' + name;
     // Fade in (CSS transition on opacity), hold 3s, then FADE OUT
     // gradually. Uses .np-hide instead of .hidden — the generic
     // .hidden is display:none !important, which kills the transition.
@@ -1508,7 +2197,7 @@
     im.onerror = function () {
       _bgImage = null;
       if (typeof onFail === 'function') onFail();
-      else if (typeof showToast === 'function') showToast('Not a valid image file');
+      else if (typeof showToast === 'function') showToast(L10n.t('toast_not_image', 'Not a valid image file'));
     };
     im.src = url;
   };
@@ -1678,7 +2367,34 @@
     return _origParseMIDI(buf);
   };
 
+  // Big-MIDI guard: a MIDI source over 1MB never stays on Integrated (the
+  // platform decode of huge MIDIs eats RAM/CPU on this hardware; preload
+  // carries them through the pool instead). Runs post clearDemo (the
+  // demo-lock would swallow the transition earlier). Demo itself is exempt
+  // (tiny file, forced integrated). Hot-open midis funnel through the same
+  // loads, so they are covered too.
+  function _bigMidToPreload() {
+    if (_integGuardsOff()) return; // kill-switch ON: no auto-switch
+    var sz = 0;
+    try { sz = window._srcMidiBytes || 0; } catch (e) {}
+    if (!(sz > 1048576)) return;
+    var cur = null;
+    try { cur = Store.getState().synthEngine; } catch (e2) {}
+    if (cur !== 'integrated') return;
+    var demo = true;
+    try { demo = (typeof isDemoActive === 'function') ? isDemoActive() : !!_demoActive; } catch (e3) {}
+    if (demo) return;
+    // Full toggle parity (values + store + persist + row repaint): a bare
+    // setState would leave the settings row showing the old engine.
+    try {
+      if (typeof Settings !== 'undefined' && Settings.setSynthEngine) Settings.setSynthEngine('preload');
+      else Store.setState({ synthEngine: 'preload' });
+    } catch (e4) {}
+    try { console.log('[Main] big MIDI ' + sz + 'B on integrated → preload'); } catch (e5) {}
+  }
+
   function loadMIDIData(midiData) {
+    _hotOpenPending = false; // a real file resolved the hot-open session
     var notes = midiData.notes || [];
     var tempo = midiData.tempo || [{ t: 0, u: 500000 }];
     var div   = midiData.div || 480;
@@ -1687,11 +2403,28 @@
     // (hot keys + Note Color Randomise). Must cover both the case where the
     // demo is still playing AND the case where it already finished (locked).
     if (_demoActive || _lockNoFile) clearDemo();
+    _bigMidToPreload();
 
-    // Loading a new file ends fullscreen — user wants the chrome.
-    exitFullscreenIfActive();
-
-    Sequencer.load(notes, tempo, div);
+    // Loading a new file KEEPS the current fullscreen state — if the user is
+    // in fullscreen, stay in fullscreen (no auto-exit, no canvas resize).
+    // Insert a valid tempo (possibly with a dead-air gap compressed — see
+    // Tempo.trimDeadAir). Trim only applies when the app is NOT in the
+    // Preload engine and no media is attached: with an audio track the MIDI
+    // must stay on the file's own timeline (trim would desync the media by
+    // the compressed span). Media is always loaded in the Preload engine.
+    var _tempoForLoad = tempo;
+    if (typeof Tempo !== 'undefined' && typeof Tempo.trimDeadAir === 'function') {
+      var _st = Store.getState();
+      // Skip trim under preload AND integrated: both play an external
+      // timeline (media file / platform MIDI audio) that trimming would desync.
+      if (_st.synthEngine !== 'preload' && _st.synthEngine !== 'integrated' && !_st.mediaSrc) {
+        try {
+          var _t = Tempo.trimDeadAir(tempo, div, notes);
+          if (_t) _tempoForLoad = _t;
+        } catch (e) {}
+      }
+    }
+    Sequencer.load(notes, _tempoForLoad, div);
 
     // Store the NORMALISED map (deduped, sorted, guaranteed tick-0 entry) —
     // the loader's values may contain duplicates/unsorted rows/gaps that
@@ -1767,10 +2500,60 @@
     return n.endsWith('.json') || n.endsWith('.note');
   }
 
+  // Sniff the first 4 bytes of a blob: 'PFA2' → binary .note, 'MThd' →
+  // MIDI, '{'/'[' → JSON text. Hot-open (File Manager) often arrives
+  // without a usable filename (defaulting to 'picked.mid'), which used to
+  // force binary .note files down the MIDI parser → "invalid file".
+  function _sniffBlobKind(blob) {
+    return new Promise(function (resolve) {
+      if (!blob || !blob.size) { resolve('unknown'); return; }
+      var fr = new FileReader();
+      var to = setTimeout(function () {
+        try { fr.abort(); } catch (e) {}
+        resolve('unknown');
+      }, 5000);
+      fr.onload = function () {
+        clearTimeout(to);
+        try {
+          var dv = new DataView(fr.result);
+          var b0 = dv.getUint8(0), b1 = dv.getUint8(1),
+              b2 = dv.getUint8(2), b3 = dv.getUint8(3);
+          if (b0 === 0x50 && b1 === 0x46 && b2 === 0x41 && b3 === 0x32) resolve('note');
+          else if (b0 === 0x4D && b1 === 0x54 && b2 === 0x68 && b3 === 0x64) resolve('midi');
+          else if (b0 === 0x7B || b0 === 0x5B) resolve('json');
+          else resolve('unknown');
+        } catch (e) { resolve('unknown'); }
+      };
+      fr.onerror = function () { clearTimeout(to); resolve('unknown'); };
+      try { fr.readAsArrayBuffer(blob.slice(0, 4)); }
+      catch (e) { clearTimeout(to); resolve('unknown'); }
+    });
+  }
+
+  // Route a hot-opened blob: trust an explicit extension, else sniff content.
+  // Matches the in-app picker behavior (non-.mid → note path with PFA2 sniff).
+  function _routeHotBlob(blob, name) {
+    var placeholder = !name;
+    if (placeholder) name = 'picked.mid';
+    showParsing(_parsingLabel(name));
+    Store.setState({ fileName: name });
+    window._midiBlob = blob;
+    window._midiName = name;
+    function goMidi() { _routeMidiBlob(blob, name); _foregroundAfterActivity(); }
+    function goNote() { _openNoteFile(blob, name); _foregroundAfterActivity(); }
+    if (_isJsonName(name)) { goNote(); return; }
+    var ln = String(name).toLowerCase();
+    if (!placeholder && (ln.endsWith('.mid') || ln.endsWith('.midi'))) { goMidi(); return; }
+    _sniffBlobKind(blob).then(function (kind) {
+      if (kind === 'note' || kind === 'json') goNote();
+      else goMidi();
+    });
+  }
+
   // Parsing pill label: MIDI-JSON files (.json/.note) read as text show
   // "Reading Data...", raw .mid files keep "Analyzing MIDI Data...".
   function _parsingLabel(name) {
-    return _isJsonName(name) ? 'Reading Data...' : 'Analyzing MIDI Data...';
+    return _isJsonName(name) ? L10n.t('reading_data', 'Reading Data...') : L10n.t('analyzing_midi', 'Analyzing MIDI Data...');
   }
 
   /**
@@ -1779,6 +2562,12 @@
   function loadMIDIJson(jsonText) {
     try {
       var midi = JSON.parse(jsonText);
+      // A JSON text file is only a MIDI export when it carries a notes
+      // array — anything else (config, empty object, …) must fail loudly
+      // instead of loading as a silent empty song with no error.
+      if (!midi || typeof midi !== 'object' || Array.isArray(midi) || !Array.isArray(midi.notes)) {
+        throw new Error('not a MIDI JSON export (missing notes array)');
+      }
       loadMIDIData(midi);
       return true;
     } catch (e) {
@@ -1788,7 +2577,19 @@
       resetLoadOnError();
       // Keep demo locked after the error (no restart) — unlock only on
       // a successful .mid/.note load via loadMIDIData -> clearDemo().
-      showErrorDialog('Could not read this file. It may not be a valid MIDI or (.note) export.');
+      // Hot-opened file: OK exits back out (same as the grant dialog);
+      // in-app picks keep the stay-in-app dialog.
+      if (_hotOpenPending) {
+        _hotOpenPending = false;
+        // NOTE: use window.pfaExit (not bare _pfaExit — that binding lives
+        // inside boot() and is invisible here; referencing it throws
+        // ReferenceError and kills the dialog entirely).
+        var _exitCb = null;
+        try { _exitCb = window.pfaExit || null; } catch (e) {}
+        showErrorDialog(L10n.t('err_cannot_read_midi', 'Could not read this file. It may not be a valid MIDI or (.note) export.'), _exitCb);
+      } else {
+        showErrorDialog(L10n.t('err_cannot_read_midi', 'Could not read this file. It may not be a valid MIDI or (.note) export.'));
+      }
       return false;
     }
   }
@@ -1835,8 +2636,14 @@
   }
 
   function loadBinaryNote(ns, displayName) {
+    _hotOpenPending = false; // a real file resolved the hot-open session
+    // Unconditional release: no .note is platform-playable, so any URL here
+    // is stale (demo.mid / previous song) — it must never sound over these
+    // visuals. (Covers converted + picked + hot-open binary opens alike.)
+    try { if (typeof _integRelease === 'function') _integRelease(); } catch (eR) {}
     if (_demoActive || _lockNoFile) clearDemo();
-    exitFullscreenIfActive();
+    _bigMidToPreload(); // converted big-midi opens switch off integrated here
+    // Loading keeps the current fullscreen state (no auto-exit).
     try { if (performance && performance.memory) console.log('[Heap] loadBinaryNote stream OPEN heapKB=' + Math.round(performance.memory.usedJSHeapSize / 1024)); } catch (e) {}
 
     Sequencer.load(ns, ns.tempoMap, ns.div);
@@ -1886,7 +2693,13 @@
 
   // Open a .note that may be PFA2 binary (stream) or legacy JSON text.
   // onDone runs after the load finishes (activity foreground, etc.).
+  // A .note is never platform-playable: release any Integrated source so a
+  // previous MIDI's audio can't drone over the note visuals.
   function _openNoteFile(blob, name, onDone) {
+    // Unconditional release (same reason as loadBinaryNote): JSON notes are
+    // not platform-playable either, and this path bypasses loadBinaryNote.
+    try { if (typeof _integRelease === 'function') _integRelease(); } catch (eR) {}
+    try { window._srcMidiBytes = 0; } catch (eS) {} // picked .note: never a big-midi source
     var display = String(name || 'file').split('/').pop();
     _isPFA2(blob).then(function (isBin) {
       if (isBin) {
@@ -1935,7 +2748,7 @@
     return _locateNoteFile(path)
       .then(function (file) {
         if (!file) { console.error('[NoteStream] converted .note not found: ' + path); fallback(); return; }
-        showParsing('Reading Data...');
+        showParsing(L10n.t('reading_data', 'Reading Data...'));
         return loadBinaryNoteFromFile(file, name);
       })
       .catch(function (e) {
@@ -2031,6 +2844,11 @@
   function clearDemo() {
     _demoActive = false;
     _lockNoFile = false;
+    // Restore a user engine the demo forced to Integrated.
+    if (_demoForcedEngine) {
+      try { Store.setState({ synthEngine: _demoForcedEngine }); } catch (e) {}
+      _demoForcedEngine = null;
+    }
     // A real file is in — the demo's fixed track colors no longer apply;
     // the user's Note Color palette takes over.
     if (typeof Notes !== 'undefined' && Notes.setDemoOverride) {
@@ -2057,6 +2875,7 @@
     if (!_demoActive && !_lockNoFile) return;
     _demoActive = false;
     try { _engine().silence(); } catch (e) {}
+    try { _integStop(); } catch (eI) {}
     if (typeof Sequencer !== 'undefined' && Sequencer.stop) {
       try { Sequencer.stop(); } catch (e) {}
     }
@@ -2079,14 +2898,26 @@
     // demo's own loadMIDIData()→hideParsing() kills the analyze OSD and the
     // demo plays underneath the real conversion.
     if (_pendingActivity || _activityBusy) return;
-    fetch('demo.note')
+    try { window._srcMidiBytes = 0; } catch (eS) {} // demo carries no big-midi state
+    fetch('js/demo.note')
       .then(function (res) {
-        if (!res.ok) throw new Error('demo.note missing (HTTP ' + res.status + ')');
+        if (!res.ok) throw new Error('js/demo.note missing (HTTP ' + res.status + ')');
         return res.text();
       })
       .then(function (txt) {
         var midi = JSON.parse(txt);
         loadMIDIData(midi);          // load notes/tempo/div, resets sequencer
+        // Demo defaults to the Integrated engine (platform demo.mid audio)
+        // regardless of the persisted engine. Store-only force — restored in
+        // clearDemo(), never persisted.
+        _demoForcedEngine = null;
+        try {
+          var _curEng = Store.getState().synthEngine;
+          if (_curEng && _curEng !== 'integrated') {
+            _demoForcedEngine = _curEng;
+            Store.setState({ synthEngine: 'integrated' });
+          }
+        } catch (e) {}
         _demoActive = true;          // set AFTER load so clearDemo isn't triggered
         _lockNoFile = true;          // hot keys + Note Color Randomise stay locked
         // Force the two demo tracks' fixed colors (yellow + water blue),
@@ -2116,11 +2947,46 @@
           try { Sequencer.setStartOffset(1.0); } catch (e) {}
         }
         HUD.setTotal(0);             // HUD shows 0/0
-        Sequencer.play();            // self-play with audio + visuals
-        Store.setState({ play: 'play', npPending: false });
-        if (typeof window.updateSoftkeys === 'function') window.updateSoftkeys();
-        if (typeof window.refreshDemoLock === 'function') window.refreshDemoLock();
-        console.log('[Main] demo track started');
+        // Integrated default engine needs platform audio for the demo: run
+        // the bundled demo.mid too (visuals stay on demo.note). Never block
+        // the demo if the mid is missing — go live either way.
+        function goLive() {
+          Sequencer.play();            // self-play with audio + visuals
+          Store.setState({ play: 'play', npPending: false });
+          if (typeof window.updateSoftkeys === 'function') window.updateSoftkeys();
+          if (typeof window.refreshDemoLock === 'function') window.refreshDemoLock();
+          console.log('[Main] demo track started');
+        }
+        try {
+          fetch('js/demo.mid').then(function (res) {
+            if (!res.ok) throw new Error('js/demo.mid missing (HTTP ' + res.status + ')');
+            return res.arrayBuffer();
+          }).then(function (ab) {
+            try {
+              var _dbb = new Blob([ab], { type: 'audio/midi' });
+              window._midiBlob = _dbb; // stash for engine-switch rebuilds
+              var _isInt = false;
+              try { _isInt = Store.getState().synthEngine === 'integrated'; } catch (eS) {}
+              if (_dbb && _isInt && typeof _integSetSource === 'function') {
+                _integSetSource(_dbb);
+                // Hold the element for the full 1s visual pre-roll so
+                // demo.mid-0 emerges exactly on the first hit instead of
+                // playing a second early at boot.
+                _integDemoHold = true;
+                try { if (_integHoldTimer) clearTimeout(_integHoldTimer); } catch (eT) {}
+                _integHoldTimer = setTimeout(function () {
+                  _integDemoHold = false;
+                  _integHoldTimer = null;
+                  _integPlay();
+                }, 1000);
+              }
+            } catch (e) {}
+            goLive();
+          }, function (e) {
+            console.warn('[Main] demo.mid unavailable:', e);
+            goLive();
+          });
+        } catch (e) { goLive(); }
       })
       .catch(function (e) {
         console.error('[Main] demo start failed:', e);
@@ -2244,7 +3110,23 @@
   function _loadSfPicked(path) {
     var sfName = path.split('/').pop();
     if (typeof Soundbank === 'undefined' || !Soundbank.loadFromFile) {
-      if (typeof window.showToast === 'function') window.showToast('Soundbank unavailable');
+      if (typeof window.showToast === 'function') window.showToast(L10n.t('toast_sf_unavailable', 'Soundbank unavailable'));
+      return;
+    }
+
+    // Check if already loaded in Soundbank
+    var existingBanks = (typeof Soundbank.getBanks === 'function') ? Soundbank.getBanks() : [];
+    var isAlreadyLoaded = existingBanks.some(function (b) {
+      return (b.path && b.path === path) || (b.name && sfName && b.name === sfName);
+    });
+
+    if (isAlreadyLoaded) {
+      var alreadyMsg = 'already loaded ' + sfName;
+      if (typeof Settings !== 'undefined' && typeof Settings.openSfDoneDialog === 'function') {
+        Settings.openSfDoneDialog(alreadyMsg);
+      } else if (typeof window.showToast === 'function') {
+        window.showToast(alreadyMsg);
+      }
       return;
     }
     var volName = (path.indexOf('/sdcard') === 0) ? 'sdcard1' : 'internal';
@@ -2258,16 +3140,20 @@
 
     function importAB(ab) {
       if (!ab) {
-        if (typeof window.showToast === 'function') window.showToast('Failed to read ' + sfName);
+        if (typeof showErrorDialog === 'function') {
+          showErrorDialog(L10n.t('err_sf_read_corrupt', 'Failed to read SoundFont "') + sfName + L10n.t('err_sf_corrupt_suffix', '". File may be moved, deleted, or corrupted.'), null, L10n.t('error', 'Error'));
+        } else if (typeof window.showToast === 'function') window.showToast(L10n.t('toast_sf_failed_read', 'Failed to read ') + sfName);
         return;
       }
       Soundbank.loadFromFile(sfName, path, volName, ab).then(function () {
         try { Store.setState({ engine: 'soundbank' }); } catch (e) {}
         if (typeof window.updateSoftkeys === 'function') window.updateSoftkeys();
-        if (typeof window.showToast === 'function') window.showToast('Loaded ' + sfName);
+        if (typeof window.showToast === 'function') window.showToast(L10n.t('toast_sf_loaded', 'Loaded ') + sfName);
       }, function (err) {
-        if (typeof window.showToast === 'function') {
-          window.showToast('Failed to load ' + sfName + ': ' + ((err && err.message) || 'parse error'));
+        if (typeof showErrorDialog === 'function') {
+          showErrorDialog(L10n.t('toast_sf_failed_load', 'Failed to load ') + sfName + ': ' + ((err && err.message) || L10n.t('err_sf_file_error', 'file error, moved, or deleted.')), null, L10n.t('error', 'Error'));
+        } else if (typeof window.showToast === 'function') {
+          window.showToast(L10n.t('toast_sf_failed_load', 'Failed to load ') + sfName + ': ' + ((err && err.message) || 'parse error'));
         }
       });
     }
@@ -2280,7 +3166,7 @@
       var attempt = 0;
       (function next() {
         if (attempt >= tries.length) {
-          if (typeof window.showToast === 'function') window.showToast('Failed to read ' + sfName);
+          if (typeof window.showToast === 'function') window.showToast(L10n.t('error_file_read', 'Failed to read') + ' ' + sfName);
           return;
         }
         var storageKey = tries[attempt++];
@@ -2297,10 +3183,10 @@
       xhr.responseType = 'arraybuffer';
       xhr.onload = function () {
         if (xhr.status === 200 && xhr.response) importAB(xhr.response);
-        else if (typeof window.showToast === 'function') window.showToast('Failed to read ' + sfName);
+        else if (typeof window.showToast === 'function') window.showToast(L10n.t('toast_sf_failed_read', 'Failed to read ') + sfName);
       };
       xhr.onerror = function () {
-        if (typeof window.showToast === 'function') window.showToast('Failed to read ' + sfName);
+        if (typeof window.showToast === 'function') window.showToast(L10n.t('toast_sf_failed_read', 'Failed to read ') + sfName);
       };
       xhr.send();
     }
@@ -2320,10 +3206,83 @@
 
   // ── KICKOFF ──
 
-  if (document.readyState === 'complete' || document.readyState === 'interactive') {
+    var _booted = false;
+  var _langPinned = false;   // one-shot: pin the saved manual language before boot
+  function tryBoot() {
+    if (_booted) return;
+    if (!(typeof L10n !== 'undefined' && L10n.isReady && L10n.isReady())) return;
+    // Boot in the user's pinned language, not the system one: switch first
+    // and let the resulting 'localized' drive the actual boot (avoids a flash
+    // of the wrong language). Auto change language (default) leaves the
+    // system locale untouched.
+    if (!_langPinned) {
+      _langPinned = true;
+      var want = null;
+      try {
+        if (typeof Settings !== 'undefined' && Settings.savedLanguage) want = Settings.savedLanguage();
+      } catch (eL) {}
+      var have = null;
+      try {
+        have = navigator.mozL10n && navigator.mozL10n.language &&
+               navigator.mozL10n.language.code;
+      } catch (eL2) {}
+      if (want && want !== have) {
+        var switched = false;
+        try { navigator.mozL10n.language.code = want; switched = true; } catch (eL3) {}
+        if (switched) {
+          // Safety net: boot anyway if 'localized' never arrives.
+          setTimeout(function () { if (!_booted) { _booted = true; boot(); } }, 1500);
+          return;
+        }
+      }
+    }
+    _booted = true;
     boot();
+  }
+
+  // A locale switch (manual pick, boot pin, or system change) retranslates the
+  // static DOM itself; dynamic settings rows are rebuilt through this hook.
+  // Plus a safety net for Auto-Off: if a system-driven switch just landed
+  // while a fixed language is pinned, pin it back (covers builds where the
+  // 'languagechange' event below never fires). Terminates: setLanguageRuntime
+  // no-ops once already on the pinned code, so this can never loop.
+  window.addEventListener('localized', function () {
+    try {
+      if (typeof Settings !== 'undefined' && Settings.onLocaleChanged) Settings.onLocaleChanged();
+    } catch (e) {}
+    try {
+      if (typeof Settings !== 'undefined' && Settings.applyLanguagePreference) {
+        Settings.applyLanguagePreference();
+      }
+    } catch (e2) {}
+  });
+
+  // While Auto change language is Off, a device language change must not
+  // change the app language — re-assert the pinned locale. Done twice: once
+  // synchronously, once deferred — mozL10n may apply the system locale
+  // BEFORE this listener runs (then the sync re-pin no-ops on the still-old
+  // code) or asynchronously AFTER it. The deferred pass wins either way,
+  // and both are no-ops when already correct so nothing can loop.
+  window.addEventListener('languagechange', function () {
+    try {
+      if (typeof Settings !== 'undefined' && Settings.applyLanguagePreference) {
+        Settings.applyLanguagePreference();
+      }
+    } catch (e) {}
+    setTimeout(function () {
+      try {
+        if (typeof Settings !== 'undefined' && Settings.applyLanguagePreference) {
+          Settings.applyLanguagePreference();
+        }
+      } catch (e2) {}
+    }, 350);
+  });
+
+  window.addEventListener('localized', tryBoot);
+  if (document.readyState === 'complete' || document.readyState === 'interactive') {
+    tryBoot();
   } else {
-    document.addEventListener('DOMContentLoaded', boot);
+    document.addEventListener('DOMContentLoaded', tryBoot);
   }
 
   // ── PARSING PROGRESS ──
@@ -2333,7 +3292,7 @@
   // label: optional text; defaults to "Analyzing MIDI Data...". .note/.json
   // MIDI files show "Reading Data..." instead (see _parsingLabel).
   function showParsing(label) {
-    var msgToken = (typeof label === 'string' && label.length) ? label : 'Analyzing MIDI Data...';
+    var msgToken = (typeof label === 'string' && label.length) ? label : L10n.t('analyzing_midi', 'Analyzing MIDI Data...');
     // Developer → Verbose while analyzing: the newest pipeline log line is
     // shown UNDER the label inside the pill (suppressed when Show Dialog is
     // Off — same Visual gate as the pill itself).
@@ -2468,7 +3427,7 @@
       var c = document.getElementById('sk-center');
       var l = document.getElementById('sk-left');
       var r = document.getElementById('sk-right');
-      if (c) c.textContent = 'OK';
+      if (c) c.textContent = L10n.t('softkey-ok', 'OK');
       if (l) l.textContent = '';
       if (r) r.textContent = '';
     }
@@ -2532,13 +3491,16 @@
   function showNowPlayingNotification(name) {
     try {
       if (typeof Notification === 'undefined') return;
+      // Without a granted permission the notification only flashes as a
+      // transient toast and is never stored in the notification panel.
+      if (Notification.permission !== 'granted') return;
       var raw = name || Store.getState().fileName || '';
       var base = _nowPlayingBasename(raw) || raw || 'Unknown';
       if (_nowPlayingNotif) { try { _nowPlayingNotif.close(); } catch (e2) {} _nowPlayingNotif = null; }
-      _nowPlayingNotif = new Notification('PFA is running', {
-        body: 'Now playing: ' + base,
+      _nowPlayingNotif = new Notification(L10n.t('notif_running', 'PFA is running'), {
+        body: L10n.t('notif_now_playing', 'Now playing: ') + base,
         tag: 'pfa-nowplaying',
-        icon: 'icons/running.png'
+        icon: 'style/icons/running.png'
       });
       _nowPlayingNotif.onclick = function () {
         try {
@@ -2555,6 +3517,93 @@
   }
   function hideNowPlayingNotification() {
     if (_nowPlayingNotif) { try { _nowPlayingNotif.close(); } catch (e) {} _nowPlayingNotif = null; }
+  }
+  // Privileged apps must request the desktop-notification permission at
+  // runtime for the notification to PERSIST in the notification panel
+  // (certified apps like the upgrade tool get it granted at install). Call
+  // this while foregrounded (boot) so the later background notification
+  // actually sticks instead of flashing as a transient toast.
+  function _ensureNotifPermission() {
+    try {
+      if (typeof Notification === 'undefined') return;
+      if (Notification.permission === 'granted' || Notification.permission === 'denied') return;
+      if (typeof Notification.requestPermission === 'function') {
+        try {
+          var p = Notification.requestPermission(function () {});
+          if (p && typeof p.then === 'function') { p.catch(function () {}); }
+        } catch (e2) {}
+      }
+    } catch (e) {}
+  }
+  // ── Background analysis notifications ────────────────────────────────
+// Pressing Back mid-conversion backgrounds the app while analysis keeps
+// running: surface "PFA is analyzing / Analyzing file: X" (loading.png),
+// then replace it with "Analysis complete / Completed file: X"
+// (success.png) when the load finishes. Both clear when the app returns
+// to the foreground. Shown only for long pipelines (never for fast
+// in-RAM parses) and only if the completion happens while hidden.
+  var _analyzeNotif = null, _analyzeDoneNotif = null;
+  function _notifLaunch() {
+    try {
+      if (navigator.mozApps && navigator.mozApps.getSelf) {
+        var req = navigator.mozApps.getSelf();
+        req.onsuccess = function () { if (req.result) req.result.launch(); };
+      } else {
+        window.focus();
+      }
+    } catch (e) {}
+  }
+  function _analyzeNotifName(name) {
+    try {
+      var raw = name || Store.getState().fileName || '';
+      var base = (typeof _nowPlayingBasename === 'function') ? _nowPlayingBasename(raw) : raw;
+      return base || raw || 'Unknown';
+    } catch (e) { return name || 'Unknown'; }
+  }
+  function _showAnalyzeNotif(name) {
+    try {
+      if (typeof Notification === 'undefined') return;
+      if (Notification.permission !== 'granted') return;
+      if (_analyzeNotif) return; // already shown
+      var base = _analyzeNotifName(name);
+      _analyzeNotif = new Notification(L10n.t('notif_analyzing', 'PFA is analyzing'), {
+        body: L10n.t('notif_analyzing_file', 'Analyzing file: ') + base,
+        tag: 'pfa-analyzing',
+        icon: 'style/icons/loading.png'
+      });
+      _analyzeNotif.onclick = _notifLaunch;
+      console.log('[Analyze] background notification shown: ' + base);
+    } catch (e) { console.warn('[Analyze] notify failed: ' + e.message); }
+  }
+  function _notifyAnalyzeDone(name) {
+    // Only meaningful if the analyzing notification was shown (i.e. the
+    // user backgrounded mid-analysis and is still away); otherwise silent.
+    try {
+      if (!_analyzeNotif) return;
+      try { _analyzeNotif.close(); } catch (e) {}
+      _analyzeNotif = null;
+      if (typeof Notification === 'undefined') return;
+      if (Notification.permission !== 'granted') return;
+      if (_analyzeDoneNotif) { try { _analyzeDoneNotif.close(); } catch (e2) {} _analyzeDoneNotif = null; }
+      _analyzeDoneNotif = new Notification(L10n.t('notif_complete', 'Analysis complete'), {
+        body: L10n.t('notif_completed_file', 'Completed file: ') + _analyzeNotifName(name),
+        tag: 'pfa-analyze-done',
+        icon: 'style/icons/success.png'
+      });
+      _analyzeDoneNotif.onclick = _notifLaunch;
+      console.log('[Analyze] completion notification shown');
+    } catch (e) { console.warn('[Analyze] done-notify failed: ' + e.message); }
+  }
+  function _notifyAnalyzeGone() {
+    try {
+      if (_analyzeNotif) { try { _analyzeNotif.close(); } catch (e) {} _analyzeNotif = null; }
+    } catch (e) {}
+  }
+  function _notifyAnalyzeClearAll() {
+    _notifyAnalyzeGone();
+    try {
+      if (_analyzeDoneNotif) { try { _analyzeDoneNotif.close(); } catch (e) {} _analyzeDoneNotif = null; }
+    } catch (e) {}
   }
   function acquireCpuWakeLock() {
     try {
@@ -2607,7 +3656,7 @@
       if (_pipelineBusy && (Date.now() - _pipelineBusyAt) < STALE_MS) {
         console.log('[Main] Clear: BLOCKED by fresh pipeline busy');
         if (typeof showDevDialog === 'function') {
-          showDevDialog('Cannot clear now — a conversion is still running.\nPress Clear again once it finishes.');
+          showDevDialog(L10n.t('dev_clear_running', 'Cannot clear now - a conversion is still running.\nPress Clear again once it finishes.'));
         }
         return;
       }
@@ -2643,7 +3692,7 @@
       console.log('[Main] Clear: getDeviceStorages returned ' + vols.length + ' volume(s)',
         vols.map(function (v) { return '' + v.storageName + '(default=' + v['default'] + ')'; }).join(' / '));
       if (!vols.length) {
-        if (typeof showDevDialog === 'function') showDevDialog('No storage available to clear.');
+        if (typeof showDevDialog === 'function') showDevDialog(L10n.t('dev_clear_no_storage', 'No storage available to clear.'));
         return;
       }
 
@@ -2661,15 +3710,15 @@ vols.forEach(function (vol) {
         try { left = (typeof Written !== 'undefined' && Written.list) ? Written.list().length : 0; } catch (e) {}
         console.log('[Main] pfa_tmp CLEAR DONE: ' + total + ' files removed; write-log now ' + left + ' path(s)');
         if (typeof showDevDialog === 'function') {
-          showDevDialog('Cleared:\n' + total + ' file(s) from the conversion cache.');
+          showDevDialog(L10n.t('dev_cleared', 'Cleared:\n') + total + L10n.t('dev_cleared_files', ' file(s) from the conversion cache.'));
         }
       }).catch(function (e3) {
         console.log('[Main] pfa_tmp clear chain error: ' + e3);
-        if (typeof showDevDialog === 'function') showDevDialog('Clear finished with errors.');
+        if (typeof showDevDialog === 'function') showDevDialog(L10n.t('dev_clear_errors', 'Clear finished with errors.'));
       });
     } catch (e) {
       console.log('[Main] Clear top-level exception: ' + e);
-      if (typeof showDevDialog === 'function') showDevDialog('Clear failed: ' + e);
+      if (typeof showDevDialog === 'function') showDevDialog(L10n.t('dev_clear_failed', 'Clear failed: ') + e);
     }
   }
 
@@ -2792,7 +3841,13 @@ vols.forEach(function (vol) {
         if (hasFile && !isDemo && st.play === 'play') {
           showNowPlayingNotification(st.fileName);
         }
+        // Backgrounded mid-analysis (conversion keeps running headless):
+        // surface progress; completion replaces it (or clears on return).
+        try { if (_pipelineBusy) _showAnalyzeNotif(st.fileName); } catch (eA) {}
       } else {
+        // Back in foreground — stale analysis notifications served their
+        // purpose (user can see the app itself again).
+        try { _notifyAnalyzeClearAll(); } catch (eC) {}
         try { if (st.play === 'play') _engine().ensure(); } catch (e5) {}
         try { onResize(); } catch (e6) {}
         // Re-acquire screen wake lock for foreground play (released on hidden).
@@ -2959,7 +4014,7 @@ vols.forEach(function (vol) {
     var vols = [];
     try { vols = (navigator.getDeviceStorages && navigator.getDeviceStorages('sdcard')) || []; }
     catch (e) {}
-    if (!vols.length) { say('No storage available to export the log.'); return; }
+    if (!vols.length) { say(L10n.t('toast_no_storage_log', 'No storage available to export the log.')); return; }
 
     var d = new Date();
     function pad(n) { return (n < 10 ? '0' : '') + n; }
@@ -3047,6 +4102,214 @@ vols.forEach(function (vol) {
 
     tryWrite();
   }
+
+  // Export the whole settings profile as a JSON .note file at
+  // others/pfa_settings_HH-MM_ddmmyyyy.note. Same wording/storage policy as
+  // the log export: removable SD first, failover across volumes, bumped
+  // filename when the destination already exists.
+  function pfaExportSettings() {
+    function say(m) { try { window.showErrorDialog(m, null, L10n.t('export_settings', 'Export Settings')); } catch (e) {} }
+    var payload = (typeof Settings !== 'undefined' && Settings.exportPayload)
+      ? Settings.exportPayload() : '';
+    if (!payload) { say(L10n.t('err_nothing_to_export', 'Nothing to export.')); return; }
+    if (typeof window.pfaStorageGranted === 'function' && !window.pfaStorageGranted()) {
+      if (typeof window.pfaGuardStorageLoad === 'function') window.pfaGuardStorageLoad(true);
+      return;
+    }
+    var vols = [];
+    try { vols = (navigator.getDeviceStorages && navigator.getDeviceStorages('sdcard')) || []; }
+    catch (e) {}
+    if (!vols.length) { say(L10n.t('err_no_storage_settings', 'No storage available to export settings.')); return; }
+
+    var d = new Date();
+    function pad(n) { return (n < 10 ? '0' : '') + n; }
+    var name = 'pfa_settings_' + pad(d.getHours()) + '-' + pad(d.getMinutes()) + '_' +
+               pad(d.getDate()) + pad(d.getMonth() + 1) + d.getFullYear() + '.note';
+
+    // Removable SD ranks above internal - EXACTLY like StorageSel.select
+    // (used by the log export) so the backup lands where the user expects.
+    function rankOf(st) {
+      var n = String((st && (st.storageName || st.name)) || '').toLowerCase();
+      var p = '';
+      try { p = String(st.path || ''); } catch (e) {}
+      if (n === 'sdcard1' || n === 'sdcard2' || /ext|remov/.test(n) || /\/sdcard1\//.test(p)) return 0;
+      if (n === 'sdcard') return 1;
+      return (st && st['default']) ? 0 : 1;
+    }
+    var ordered = vols.slice().sort(function (a, b) { return rankOf(a) - rankOf(b); });
+
+    var done = false;
+    var vi = 0;        // volume index into ordered[]
+    var attempt = 0;   // filename suffix attempt on the CURRENT volume
+    var lastErr = '';
+
+    function nextVolume() {
+      if (vi + 1 < ordered.length && !done) {
+        vi++;
+        attempt = 0;
+        tryWrite();
+      } else if (!done) {
+        done = true;
+        say(L10n.t('err_export_failed', 'Settings export failed: ') + (lastErr || L10n.t('err_vols_unavail', 'all storage volumes unavailable')));
+      }
+    }
+
+    function tryWrite() {
+      if (done) return;
+      var st = ordered[vi];
+      if (!st) { done = true; say(L10n.t('err_no_writable', 'Settings export failed: no writable storage volume.')); return; }
+      var nm = (attempt === 0) ? name : name.replace(/\.note$/, '_' + attempt + '.note');
+      var req;
+      try { req = st.addNamed(new Blob([payload], { type: 'application/json;charset=utf-8' }), 'others/' + nm); }
+      catch (e) { lastErr = String(e); nextVolume(); return; }
+      var t = setTimeout(function () {
+        done = true;
+        say(L10n.t('settings_exported', 'Settings exported:\nothers/') + nm);
+      }, 500);
+      req.onsuccess = function () {
+        if (done) return;
+        done = true;
+        clearTimeout(t);
+        say(L10n.t('settings_exported', 'Settings exported:\nothers/') + nm);
+      };
+      req.onerror = function () {
+        if (done) return;
+        clearTimeout(t);
+        var en = (req.error && req.error.name) || '';
+        if (en === 'SecurityError') {
+          done = true;
+          say(L10n.t('err_export_blocked', 'Settings export blocked: allow device-storage:sdcard permission, then retry.'));
+          return;
+        }
+        lastErr = en;
+        if (en === 'NoModificationAllowedError' && attempt < 5) {
+          attempt++;
+          tryWrite();
+        } else {
+          nextVolume();
+        }
+      };
+    }
+
+    tryWrite();
+  }
+
+  // Import a settings .note (System → Import Settings). Picks through the
+  // File Manager, then VALIDATES before applying: the file must end in .note
+  // (a non-.note choice → error dialog) AND its content must be the JSON
+  // settings payload. A .note that is actually a binary MIDI export (PFA magic)
+  // or plain MIDI-JSON is refused with a dialog instead of being applied.
+  function pfaImportSettings() {
+    function say(m) { try { window.showErrorDialog(m, null, L10n.t('import_settings', 'Import Settings')); } catch (e) {} }
+    function extractBlob(res) {
+      if (!res) return null;
+      if (res.blob) return res.blob;
+      if (res.blobs && res.blobs.length) return res.blobs[0];
+      if (res.data) {
+        if (res.data.blob) return res.data.blob;
+        if (res.data.blobs && res.data.blobs.length) return res.data.blobs[0];
+      }
+      return null;
+    }
+    function extractName(res) {
+      if (!res) return '';
+      var n = res.name
+        || (res.blob && res.blob.name)
+        || (res.data && (res.data.name || (res.data.blob && res.data.blob.name)))
+        || '';
+      return String(n || '');
+    }
+    // Blob → text (prefer the modern API, fall back to FileReader).
+    function blobAsText(blob) {
+      return new Promise(function (resolve, reject) {
+        function legacy() {
+          var fr = new FileReader();
+          fr.onload = function () { resolve(String(fr.result || '')); };
+          fr.onerror = function () { reject(new Error('FileReader failed')); };
+          fr.readAsText(blob);
+        }
+        if (blob && typeof blob.text === 'function') {
+          try { blob.text().then(resolve, legacy); return; } catch (e) { legacy(); }
+        } else legacy();
+      });
+    }
+    // The first bytes of the file (to detect a PFA1/PFA2 binary .note).
+    function blobHead(blob) {
+      return new Promise(function (resolve, reject) {
+        try {
+          var fr = new FileReader();
+          fr.onload = function () {
+            try {
+              var arr = new Uint8Array(fr.result);
+              var head = [];
+              for (var i = 0; i < arr.length && i < 8; i++) head.push(arr[i]);
+              resolve(head);
+            } catch (e) { reject(new Error('head decode')); }
+          };
+          fr.onerror = function () { reject(new Error('head read')); };
+          fr.readAsArrayBuffer(blob.slice(0, 8));
+        } catch (e) { reject(e); }
+      });
+    }
+    function parseAndApply(name, blob) {
+      function readTextPath() {
+        blobAsText(blob).then(function (text) {
+          var parsed;
+          try { parsed = JSON.parse(text); }
+          catch (e) {
+            say(L10n.t('err_import_bad', 'Could not read this file.\n\nIt is not a Settings export.'));
+            return;
+          }
+          if (!parsed || typeof parsed !== 'object' ||
+              parsed.pfaSettings !== 1 || !parsed.values) {
+            say(L10n.t('err_import_no_marker', 'This .note is not a Settings export\n(missing the Settings marker).'));
+            return;
+          }
+          var ok = (typeof Settings !== 'undefined' && Settings.applyImportedSettings)
+            ? Settings.applyImportedSettings(parsed) : false;
+          if (!ok) say(L10n.t('err_import_apply', 'Could not apply the imported settings.'));
+        }, function () { say(L10n.t('err_import_read', 'Could not read this file.')); });
+      }
+      // Sniff BEFORE reading: a 75MB binary .note must be refused from its
+      // first bytes — decoding it wholesale to text wedges a 512MB device
+      // long before validation even runs.
+      blobHead(blob).then(function (head) {
+        if (head && head.length >= 4 &&
+            ((head[0] === 0x50 && head[1] === 0x46) || // PFA1/PFA2 .note
+             (head[0] === 0x4D && head[1] === 0x54))) { // MThd MIDI
+          say(L10n.t('err_import_binary', 'This .note is a binary MIDI export,\nnot a Settings config.\n\nImport only Settings files exported via Export Settings.'));
+          return;
+        }
+        readTextPath();
+      }, function () { readTextPath(); });
+    }
+    try {
+      if (window._pickImportOpen) return;
+      window._pickImportOpen = true;
+      var activity = new MozActivity({
+        name: 'pick'
+      });
+      activity.onsuccess = function () {
+        window._pickImportOpen = false;
+        var blob = extractBlob(this.result);
+        var name = extractName(this.result) || (blob && blob.name) || '';
+        if (!blob) { say(L10n.t('err_import_read', 'Cannot read that file.')); return; }
+        // "picker with filter": only .note configs may be imported. Anything
+        // else is refused BEFORE reading so no conftype gets applied by mistake.
+        if (!/\.note$/i.test(String(name).trim())) {
+          say(L10n.t('err_import_not_note', 'Only .note Settings configs can be imported.\n\nPicked: ') +
+              (name || '(no name)'));
+          return;
+        }
+        parseAndApply(name, blob);
+      };
+      activity.onerror = function () { window._pickImportOpen = false; };
+    } catch (e) {
+      window._pickImportOpen = false;
+      say(L10n.t('err_picker', 'Cannot launch the file picker.'));
+    }
+  }
+
   _devHookOnce();
 // ── Storage raw diagnostic (Developer → Storage Test) ────────────────
   // Uses DeviceStorage DIRECTLY (no probe machinery) so a hang/failure is
@@ -3173,11 +4436,13 @@ vols.forEach(function (vol) {
       'pfa_tmp write-log: ' + wl.length +
       (wl.length ? '\n' + wl.map(function (p) { return '  - ' + p; }).join('\n') : ' (empty)');
     console.log('[Dev] MEM\n' + lines);
-    say('Memory:\n' + lines.replace(/\n /g, '\n'));
+    say(L10n.t('memory', 'Memory') + ':\n' + lines.replace(/\n /g, '\n'));
   }
   window.pfaDumpMemory = pfaDumpMemory;
   window.pfaSetDevOsd = pfaSetDevOsd;
   window.pfaExportLog = pfaExportLog;
+  window.pfaExportSettings = pfaExportSettings;
+  window.pfaImportSettings = pfaImportSettings;
   window.pfaStorageSel = (typeof StorageSel !== 'undefined') ? StorageSel : null;
   window.pfaStorageDiagnose = pfaStorageDiagnose;
   window.showDevDialog = showDevDialog;

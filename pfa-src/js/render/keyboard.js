@@ -5,9 +5,10 @@
  * highlights.
  *
  * Visual Settings integration:
- *   - pianoSize 'big'|'small'|'none' → strip height 60/32/0 px
- *   - kbStart/kbEnd                  → visible note window (21..108 default)
- *   - pianoColorHex                  → custom white-key fill color
+ *  - pianoSize 'big'|'small'|'none' → strip height 60/32/0 px
+ *  - kbStart/kbEnd                  → visible note window (21..108 default)
+ *  - pianoColorHex                  → custom white-key fill color
+ *  - view3dKeyGlow/view3dGlowColor  → 3D impact glow toggle and RGBA color
  */
 var Keyboard = (function () {
   'use strict';
@@ -29,6 +30,15 @@ var Keyboard = (function () {
   var NOTE_NAMES = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
   var SHOW_OCTAVE = true;
 
+  // Highlight pool: one slot per key + frame stamp dedupes without per-frame
+  // map/entry allocations (was ~2k short-lived objects/frame at density →
+  // GC pauses). Same last-wins, same pixels, same draw order.
+  var _hlW = [], _hlB = [], _hlWh = [], _hlBh = [], _hlStamp = 0;
+  for (var _hi = 0; _hi < 128; _hi++) {
+    _hlW.push({ dx: 0, w: 0, col: null, stamp: 0 });
+    _hlB.push({ dx: 0, w: 0, col: null, sx: 0, stamp: 0 });
+  }
+
   /** Strip height in px for the current pianoSize setting ('none' → 0). */
   function height(state) {
     var ps = (state && state.pianoSize) || 'big';
@@ -39,6 +49,90 @@ var Keyboard = (function () {
   /** Black keys are ~60% of the strip height at any size. */
   function blackHeight(kbH) {
     return Math.round(kbH * 0.6);
+  }
+
+  /** 'white' is the factory default for the 3D key glow. */
+  function keyGlowOn(state, kb3d) {
+    if (!kb3d) return false;
+    if (state && state.view3dKeyGlow === false) return false;
+    return true;
+  }
+
+  /** Parse '#rgb'/'#rrggbb'/'rgb()'/'rgba()' into {r,g,b,a:0..1}. */
+  function glowRgba(css) {
+    var fallback = { r: 255, g: 255, b: 255, a: 1 };
+    if (css == null) return fallback;
+    var s = String(css).trim();
+    if (!s) return fallback;
+    var m = s.match(/^rgba?\s*\(\s*([+-]?\d+(?:\.\d+)?)\s*,\s*([+-]?\d+(?:\.\d+)?)\s*,\s*([+-]?\d+(?:\.\d+)?)\s*(?:,\s*([+-]?\d+(?:\.\d+)?%?)\s*)?\)$/i);
+    if (m) {
+      var alpha = 1;
+      if (m[4] != null && m[4] !== '') {
+        if (m[4].charAt(m[4].length - 1) === '%') alpha = parseFloat(m[4]) / 100;
+        else {
+          alpha = parseFloat(m[4]);
+          if (alpha > 1) alpha = alpha / 100;
+        }
+      }
+      return {
+        r: Math.max(0, Math.min(255, Math.round(parseFloat(m[1])))),
+        g: Math.max(0, Math.min(255, Math.round(parseFloat(m[2])))),
+        b: Math.max(0, Math.min(255, Math.round(parseFloat(m[3])))),
+        a: Math.max(0, Math.min(1, isFinite(alpha) ? alpha : 1))
+      };
+    }
+    var h = s.charAt(0) === '#' ? s.substring(1) : s;
+    if (h.length === 3) {
+      h = h.charAt(0) + h.charAt(0) + h.charAt(1) + h.charAt(1) + h.charAt(2) + h.charAt(2);
+    }
+    if (!/^[0-9a-fA-F]{6}$/.test(h)) return fallback;
+    return {
+      r: parseInt(h.substring(0, 2), 16),
+      g: parseInt(h.substring(2, 4), 16),
+      b: parseInt(h.substring(4, 6), 16),
+      a: 1
+    };
+  }
+
+  /** Current 3D key-glow color from Visual → Graphics → Effects Colors. */
+  function glowColor(state) {
+    var css = (state && state.view3dGlowColor) ? state.view3dGlowColor : '#FFFFFF';
+    try { if (typeof window.demoVisualValue === 'function') css = window.demoVisualValue('view3dGlowColor', css); } catch (e) {}
+    return glowRgba(css);
+  }
+
+  /**
+   * Draw the upgraded impact glow: an upward halo plus a bright core where
+   * the falling note meets the strip. The halo colors follow Effects Colors.
+   */
+  function drawKeyGlow(ctx, state, hits, y, coreH, kbH) {
+    var glow = glowColor(state);
+    if (glow.a <= 0) return;
+    var glowH = Math.max(4, Math.round(kbH * 0.14));
+    var haloH = glowH + coreH;
+    var haloOuter = 'rgba(' + glow.r + ',' + glow.g + ',' + glow.b + ',' + (glow.a * 0.18).toFixed(3) + ')';
+    var haloInner = 'rgba(' + glow.r + ',' + glow.g + ',' + glow.b + ',' + (glow.a * 0.42).toFixed(3) + ')';
+    var core = 'rgba(' + glow.r + ',' + glow.g + ',' + glow.b + ',' + glow.a.toFixed(3) + ')';
+    var i, e, innerH;
+
+    ctx.fillStyle = haloOuter;
+    for (i = 0; i < hits.length; i++) {
+      e = hits[i];
+      ctx.fillRect(e.dx, y - glowH, e.w, haloH);
+    }
+
+    innerH = Math.ceil(haloH / 2);
+    ctx.fillStyle = haloInner;
+    for (i = 0; i < hits.length; i++) {
+      e = hits[i];
+      ctx.fillRect(e.dx, y - glowH + haloH - innerH, e.w, innerH);
+    }
+
+    ctx.fillStyle = core;
+    for (i = 0; i < hits.length; i++) {
+      e = hits[i];
+      ctx.fillRect(e.dx, y, e.w, coreH);
+    }
   }
 
   function buildLayout(keyW) {
@@ -108,7 +202,9 @@ var Keyboard = (function () {
 
     // 3D depth (Graphics → 3D View 'keyboard'/'both'): white keys carry a
     // soft shadow tucked under the bar; black keys catch a 1px light on
-    // the top edge. Baked into the cached sprite — zero per-frame cost.
+    // the top edge; every key gets a darker, slightly recessed FRONT face
+    // split from the top surface by a horizontal crease — the classic 3D
+    // key profile. Baked into the cached sprite — zero per-frame cost.
     if (is3d) {
       c.fillStyle = 'rgba(0,0,0,0.28)';
       for (var s3 = 0; s3 < 128; s3++) {
@@ -121,6 +217,40 @@ var Keyboard = (function () {
         var ks4 = keyLayout[s4];
         if (!ks4.black) continue;
         c.fillRect(ks4.x + 1, 0, ks4.w - 2, 1);
+      }
+      // Front face height: ~5% of the strip (min 2px so it shows at any size).
+      var frontH = Math.max(2, Math.round(kbH * 0.05));
+      var frontY = kbH - frontH;
+      // White keys — front face darkened via a translucent black overlay
+      // (works over ANY piano color), inset 1px each side so the face sits
+      // back from the top surface.
+      c.fillStyle = 'rgba(0,0,0,0.45)';
+      for (var s5 = 0; s5 < 128; s5++) {
+        var ks5 = keyLayout[s5];
+        if (ks5.black) continue;
+        c.fillRect(ks5.x + 1, frontY + 1, ks5.w - 3, frontH - 1);
+      }
+      // White keys — the crease: horizontal line separating top from front.
+      c.fillStyle = 'rgba(0,0,0,0.5)';
+      for (var s6 = 0; s6 < 128; s6++) {
+        var ks6 = keyLayout[s6];
+        if (ks6.black) continue;
+        c.fillRect(ks6.x, frontY, ks6.w - 1, 1);
+      }
+      // Black keys — deeper front base, inset 1px each side, plus a subtle
+      // light crease so the separation reads on the dark surface.
+      var bhFront = Math.max(2, Math.round(bh * 0.05));
+      c.fillStyle = 'rgba(0,0,0,0.5)';
+      for (var s7 = 0; s7 < 128; s7++) {
+        var ks7 = keyLayout[s7];
+        if (!ks7.black) continue;
+        c.fillRect(ks7.x + 1, bh - bhFront, ks7.w - 2, bhFront);
+      }
+      c.fillStyle = 'rgba(255,255,255,0.16)';
+      for (var s8 = 0; s8 < 128; s8++) {
+        var ks8 = keyLayout[s8];
+        if (!ks8.black) continue;
+        c.fillRect(ks8.x + 1, bh - bhFront, ks8.w - 2, 1);
       }
     }
   }
@@ -136,6 +266,7 @@ var Keyboard = (function () {
     var v3d = (state.view3d != null) ? state.view3d : 'both';
     try { if (typeof window.demoVisualValue === 'function') v3d = window.demoVisualValue('view3d', v3d); } catch (e) {}
     var kb3d = (v3d === 'keyboard' || v3d === 'both');
+    var glowOn = keyGlowOn(state, kb3d);
 
     // Rebuild the spritesheet whenever keyWidth, strip size, color or the
     // 3D depth flag changed.
@@ -150,8 +281,13 @@ var Keyboard = (function () {
 
     // Visible window — Keyboard Range [kbStart..kbEnd] replaces the old
     // camKey scroll (Left/Right are bound to seeking now).
-    var startN = (state.kbStart != null) ? state.kbStart : 21;
-    var endN   = (state.kbEnd   != null) ? state.kbEnd   : 108;
+    // kbSize 'dynamic' auto-expands past 88 keys for out-of-range notes.
+    var _kbdr = (typeof Notes !== 'undefined' && Notes.dynRange)
+      ? Notes.dynRange(state) : { start: null, end: null };
+    var startN = (_kbdr.start != null) ? _kbdr.start
+      : ((state.kbStart != null) ? state.kbStart : 21);
+    var endN   = (_kbdr.end != null) ? _kbdr.end
+      : ((state.kbEnd   != null) ? state.kbEnd   : 108);
     try {
       if (typeof window.demoVisualValue === 'function') {
         startN = window.demoVisualValue('kbStart', startN);
@@ -243,7 +379,21 @@ var Keyboard = (function () {
       }
       if (live && live.length) {
         var ns = Sequencer.getTime();
-        var wh = [], bhl = [];
+        var wh = _hlWh, bhl = _hlBh;
+        wh.length = 0; bhl.length = 0;
+        _hlStamp++;
+        // Dedupe per key via frame-stamped slots (pooled, zero alloc):
+        // the TOP overlapping note wins — same last-wins as the old maps
+        // (later entries overwrite the same slot). Early-out: at wall density
+        // every key lights within the first few hundred entries — the rest can
+        // add nothing new. Only engages when ALL range keys are lit, never in
+        // normal sections.
+        var _litNeed = (endN - startN + 1), _litGot = 0;
+        // Dedupe per key: the TOP overlapping note wins — on the falling band
+        // the last-drawn note covers the earlier ones, so the lit key shows
+        // the SAME resulting color the falling notes display at the overlap
+        // (later live entries overwrite earlier ones → "last wins"). Each key
+        // still draws exactly ONCE so alpha never accumulates (no darkening).
         var CH = (typeof Notes !== 'undefined' && Notes.channelColor) ? Notes.channelColor : null;
         var SCAN_LIMIT = 1180591620717411303424;
         // Trail: state.trail is a number 0.1..8.0 (seconds × scale)
@@ -265,9 +415,21 @@ var Keyboard = (function () {
           if (ns < ss || ns > nsLim) continue;
           var dx = kl.x - x0;
           if (dx < -kl.w || dx > w) continue;
+          // Overlapping same-pitch notes (fast rolls, doubled tracks) would
+          // fill the semi-transparent highlight N times on ONE key → alpha
+          // accumulates → the key reads darker than a single note. Dedupe
+          // by key so every lit key is drawn exactly ONCE per frame.
           var col = CH ? CH(live[i].channel) : '#00C8FF';
-          if (kl.black) bhl.push({ dx: dx, w: kl.w, col: col, sx: kl.x });
-          else          wh.push({ dx: dx, w: kl.w, col: col });
+          if (kl.black) {
+            var sb = _hlB[nn];
+            sb.dx = dx; sb.w = kl.w; sb.col = col; sb.sx = kl.x;
+            if (sb.stamp !== _hlStamp) { sb.stamp = _hlStamp; bhl.push(sb); _litGot++; }
+          } else {
+            var sw = _hlW[nn];
+            sw.dx = dx; sw.w = kl.w; sw.col = col;
+            if (sw.stamp !== _hlStamp) { sw.stamp = _hlStamp; wh.push(sw); _litGot++; }
+          }
+          if (_litGot >= _litNeed) break;
         }
 
         // White highlights (drawn UNDER the black keys — they are re-blitted
@@ -280,15 +442,8 @@ var Keyboard = (function () {
             ctx.fillRect(wh[wi].dx, y, wh[wi].w, kbH);
           }
           ctx.globalAlpha = 1;
-          // 3D pop: bright rim where the lit key meets the bar.
-          if (kb3d) {
-            ctx.fillStyle = '#ffffff';
-            ctx.globalAlpha = 0.85;
-            for (var wr = 0; wr < wh.length; wr++) {
-              ctx.fillRect(wh[wr].dx, y, wh[wr].w, 2);
-            }
-            ctx.globalAlpha = 1;
-          }
+          // 3D pop: configurable impact glow where the lit key meets the bar.
+          if (glowOn) drawKeyGlow(ctx, state, wh, y, 2, kbH);
         }
 
         // Re-blit EVERY black key in the visible window whenever a white
@@ -313,15 +468,8 @@ var Keyboard = (function () {
             ctx.fillRect(bhl[bj].dx, y, bhl[bj].w, bh2);
           }
           ctx.globalAlpha = 1;
-          // 3D pop: bright rim where the lit key meets the bar.
-          if (kb3d) {
-            ctx.fillStyle = '#ffffff';
-            ctx.globalAlpha = 0.85;
-            for (var br = 0; br < bhl.length; br++) {
-              ctx.fillRect(bhl[br].dx, y, bhl[br].w, 1);
-            }
-            ctx.globalAlpha = 1;
-          }
+          // 3D pop: configurable impact glow where the lit key meets the bar.
+          if (glowOn) drawKeyGlow(ctx, state, bhl, y, 1, kbH);
         }
       }
     } catch(e) {}
@@ -341,8 +489,12 @@ var Keyboard = (function () {
    * (demo self-play forces 21..108 via demoVisualValue).
    */
   function _visibleRange(state) {
-    var startN = (state && state.kbStart != null) ? state.kbStart : 21;
-    var endN   = (state && state.kbEnd   != null) ? state.kbEnd   : 108;
+    var _vrdr = (typeof Notes !== 'undefined' && Notes.dynRange)
+      ? Notes.dynRange(state) : { start: null, end: null };
+    var startN = (_vrdr.start != null) ? _vrdr.start
+      : ((state && state.kbStart != null) ? state.kbStart : 21);
+    var endN   = (_vrdr.end != null) ? _vrdr.end
+      : ((state && state.kbEnd   != null) ? state.kbEnd   : 108);
     try {
       if (typeof window.demoVisualValue === 'function') {
         startN = window.demoVisualValue('kbStart', startN);

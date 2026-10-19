@@ -41,8 +41,9 @@ var Store = (function () {
     kbStart: 21,
     kbEnd:   108,
 
-    // Keyboard Range preset: '88' | '128' | 'custom'.
+    // Keyboard Range preset: '88' | '128' | 'custom' | 'dynamic'.
     // 'custom' keeps kbStart/kbEnd as-is and shows the Start/End sliders.
+    // 'dynamic' bases on 88 and auto-expands past it for out-of-range notes.
     kbSize:   '88',
 
     // Piano strip size: 'big' (60px) | 'small' (32px) | 'none' (hidden)
@@ -50,6 +51,9 @@ var Store = (function () {
 
     // 3D view mode: 'keyboard' | 'notefall' | 'both' | 'none'
     view3d: 'both',
+    view3dFallOpacity: 100,
+    view3dKeyGlow: true,
+    view3dGlowColor: '#FFFFFF',
 
     // Active note color palette id ('random' | 'randomAlpha' | etc.)
     palette: 'random',
@@ -102,6 +106,9 @@ var Store = (function () {
     // Developer options (mirrored from localStorage by settings.js)
     osdLog:         false, // On-screen verbose status overlay
     verboseAnalyze: false, // show [LOG] detail in analysis progress
+    verboseInit:    false, // show text log above % in launch/boot screen (default false/Off)
+    verboseLoadLog: false, // show text log in launch/soundfont loading screen (default false/Off)
+    disIntegGuard:  false, // master kill-switch for Integrated guards (default: guards ON)
     pctAnalyze:     false, // show the percentage readout during analysis (parse)
     pctMerge:       false, // show the percentage readout during the merge stage
     pctBarVisible:  true,  // show/hide the loading bar itself (Visual → Loading Bar)
@@ -114,6 +121,7 @@ var Store = (function () {
     // System settings (auto fullscreen / rotate on launch)
     autoFullscreen: false,
     autoRotate:     false,
+    focusColor:     '#0066cc',
 
     // Start Delay countdown (HUD time shows -0:05 → 0:00 while active)
     startCountdown: null,  // seconds remaining (null = inactive)
