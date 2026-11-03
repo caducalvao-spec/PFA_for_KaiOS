@@ -69,6 +69,12 @@ html, body {
 @font-face {
   font-family: 'gaia-icons';
   src: url('fonts/gaia-icons.ttf') format('truetype');
+  font-weight: normal;
+  font-style: normal;
+}
+@font-face {
+  font-family: 'gaia-icons';
+  src: url('fonts/gaia-icons.ttf') format('truetype');
   font-weight: 500;
   font-style: normal;
 }

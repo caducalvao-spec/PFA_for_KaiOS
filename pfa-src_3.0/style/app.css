@@ -559,31 +559,47 @@
 
 /* ── SoundFont rows (Settings → Synth → Load Soundfont) ─────────────── */
 
-/* Square CHECKBOX glyph — kai-icons font (NOT the circular radio set:
-   \e902 unchecked square, \e901 checked square with a tick). */
+/* KaiOS system multi-select tick — Gaia check-off / check-on. */
 .sf-check {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   flex-shrink: 0;
-  width: 2rem;
-  height: 2rem;
-  margin-left: 1rem;
+  width: 3.2rem;
+  height: 3.2rem;
+  min-width: 3.2rem;
+  max-width: 3.2rem;
+  margin-left: 0.8rem;
   margin-right: 1.2rem;
-  font-family: 'kai-icons';
-  font-size: 2rem;
-  line-height: 2rem;
+  border: none !important;
+  background: transparent !important;
+  box-sizing: border-box;
+  font-family: 'gaia-icons' !important;
+  font-size: 3.2rem;
+  font-weight: normal;
+  line-height: 1;
   text-align: center;
-  color: var(--color-gs70);
+  color: var(--color-gs45, #888888);
+  vertical-align: middle;
 }
 .sf-check::before {
-  content: '\e902'; /* kai-icon-checkbox-unchecked */
+  font-family: 'gaia-icons' !important;
+  content: '\f194'; /* check-off */
   display: block;
   width: 100%;
+  line-height: 1;
 }
-.sf-check.selected::before {
-  content: '\e901'; /* kai-icon-checkbox-checked */
+.sf-check.selected::before,
+.sf-check.checked::before,
+.sf-check[data-icon="check-on"]::before {
+  content: '\f195'; /* check-on */
   color: var(--color-focus, #0066cc);
 }
-.sf-row.focused .sf-check.selected::before {
-  color: #ffffff;
+.sf-row.focused .sf-check,
+.sf-row.focused .sf-check::before,
+.sf-row.focused .sf-check.selected::before,
+.sf-row.focused .sf-check.checked::before {
+  color: #ffffff !important;
 }
 
 /* Scan-page rows (subsettings): checkbox + name + partition/path meta. */
